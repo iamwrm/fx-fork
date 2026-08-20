@@ -74,6 +74,8 @@ a non-Codex model route.
 - Function tools are translated from fx's `inputSchema` shape to Responses
   `parameters`.
 - Assistant tool calls and tool outputs preserve their call IDs.
+- AI Gateway-only provider advertisements are omitted from direct Codex
+  requests; local function tools continue to be translated normally.
 - Server-sent events stream text deltas, reasoning summaries, tool arguments,
   completion state, errors, and usage into fx's existing callbacks.
 - ChatGPT account, originator, beta, session, user-agent, and streaming headers
@@ -126,6 +128,7 @@ The focused suite covers:
 - request schema, tools, and prompt cache fields
 - text-only requests while the optional Vision tool is available
 - compatible `openai/` model aliases and rejection of unsupported aliases
+- omission of AI Gateway-only provider advertisements from direct requests
 - streamed text, reasoning, tool calls, completion, and usage
 - local model capabilities
 - isolation from the Vercel model catalog
