@@ -1,0 +1,173 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
+        default: v0.0.4-codex.1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fx-codex-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/vercel-labs/fx.git
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-linux
+          - name: macos-aarch64
+            os: macos-15
+            target: aarch64-macos
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check out pinned upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=$(tr -d '\r\n' < patches/fx/BASE)
+          expected_commit=$(tr -d '\r\n' < patches/fx/BASE_COMMIT)
+          git init checkouts/fx
+          git -C checkouts/fx remote add origin "$UPSTREAM_REPO"
+          git -C checkouts/fx fetch --depth 1 origin "$base"
+          git -C checkouts/fx checkout --detach FETCH_HEAD
+          actual_commit=$(git -C checkouts/fx rev-parse HEAD)
+          test "$actual_commit" = "$expected_commit"
+
+      - name: Apply patch stack
+        shell: bash
+        working-directory: checkouts/fx
+        run: |
+          set -euo pipefail
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          git am ../../patches/fx/*.patch
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Build ReleaseSafe binary
+        working-directory: checkouts/fx
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Test Codex support
+        working-directory: checkouts/fx
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build test-openai-codex -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} --summary all
+          ./zig-out/bin/fx --version
+          ./zig-out/bin/fx login --help | grep 'OpenAI Codex'
+
+      - name: Validate Linux binary
+        if: runner.os == 'Linux'
+        working-directory: checkouts/fx
+        run: file zig-out/bin/fx | grep 'ELF 64-bit.*x86-64'
+
+      - name: Sign and validate macOS binary
+        if: runner.os == 'macOS'
+        working-directory: checkouts/fx
+        shell: bash
+        run: |
+          set -euo pipefail
+          file zig-out/bin/fx | grep -E 'Mach-O 64-bit.*arm64'
+          codesign --force --sign - zig-out/bin/fx
+          codesign --verify --verbose=2 zig-out/bin/fx
+
+      - name: Package
+        working-directory: checkouts/fx
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="fx-${{ matrix.name }}.tar.gz"
+          package_dir="$RUNNER_TEMP/fx-${{ matrix.name }}"
+          mkdir -p "$package_dir"
+          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "$archive" -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            shasum -a 256 "$archive" > "$archive.sha256"
+          else
+            sha256sum "$archive" > "$archive.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fx-${{ matrix.name }}
+          path: |
+            checkouts/fx/fx-${{ matrix.name }}.tar.gz
+            checkouts/fx/fx-${{ matrix.name }}.tar.gz.sha256
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: fx-*
+          merge-multiple: true
+
+      - name: Verify archives
+        run: sha256sum --check fx-*.tar.gz.sha256
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${REQUESTED_TAG:-v0.0.4-codex.1}"
+          if ! [[ "$release_tag" =~ ^v0\.0\.4-codex\.[1-9][0-9]*$ ]]; then
+            echo "::error::release tag must match v0.0.4-codex.N"
+            exit 1
+          fi
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $release_tag already exists"
+            exit 1
+          fi
+          printf '%s\n' \
+            'OpenAI Codex subscription support for fx 0.0.4.' \
+            '' \
+            '- Device-code login with refreshable OpenAI credentials' \
+            '- Direct ChatGPT Codex Responses transport' \
+            '- Reasoning and function-tool streaming' \
+            '- Codex credential isolation from Vercel AI Gateway' \
+            '' \
+            'Built from the pinned vercel-labs/fx base and the IV-0001 patch in this repository.' \
+            'Both archives include LICENSE and THIRD_PARTY_NOTICES.md.' \
+            'The macOS arm64 executable is ad-hoc signed and is not Apple-notarized.' \
+            > release-notes.md
+          gh release create "$release_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "fx $release_tag" \
+            --notes-file release-notes.md \
+            fx-*.tar.gz fx-*.tar.gz.sha256

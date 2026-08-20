@@ -40,10 +40,21 @@ The login flow uses OpenAI's device authorization flow and selects
 `openai-codex/gpt-5.6-sol`. Subscription traffic goes directly to the ChatGPT
 Codex Responses endpoint, never through Vercel AI Gateway.
 
+## Releases
+
+Release `v0.0.4-codex.1` provides `fx-linux-x86_64.tar.gz` and
+`fx-macos-aarch64.tar.gz`, plus a SHA-256 file for each archive. Both packages
+include the fx binary, `LICENSE`, and `THIRD_PARTY_NOTICES.md`.
+
+The macOS arm64 executable is ad-hoc signed but is not Apple-notarized.
+Background auto-upgrade and `fx upgrade` are disabled in patched builds so an
+official upstream binary cannot silently replace the Codex transport.
+
 ## Patch layout
 
 - `patches/fx/BASE`: the upstream ref used to materialize a checkout
 - `patches/fx/BASE_COMMIT`: the exact upstream commit CI requires
 - `patches/fx/*.patch`: ordered `git format-patch` mailboxes
 - `docs/IV-*.md`: durable design and maintenance records
+- `.github/workflows/release.yml`: native release builds and GitHub publication
 - `checkouts/`: optional local working trees, ignored by Git

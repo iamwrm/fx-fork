@@ -8,7 +8,8 @@
   [`ac0ce0b64409404b3f35cc264f62c5d14ef1ba37`](https://github.com/vercel-labs/fx/commit/ac0ce0b64409404b3f35cc264f62c5d14ef1ba37)
 - **Reference implementation:**
   [earendil-works/pi at `b7bb00b936dbe21b8e160b3e89efdec361846699`](https://github.com/earendil-works/pi/tree/b7bb00b936dbe21b8e160b3e89efdec361846699)
-- **Deliverable:** `patches/fx/0001-IV-0001-Add-OpenAI-Codex-subscription-support.patch`
+- **Deliverables:** the ordered `patches/fx/*.patch` mailbox series and
+  `.github/workflows/release.yml`
 
 ## Purpose
 
@@ -85,6 +86,14 @@ tools, parallel tool calls, reasoning levels through `xhigh`, and the context
 and output limits used by the provider. The direct model remains usable even
 though it is intentionally absent from Vercel's public model catalog.
 
+### Fork update safeguard
+
+Both background auto-upgrade and the manual `fx upgrade` command are disabled
+in patched builds. Upstream release artifacts do not contain the Codex
+subscription transport, so allowing the official updater to replace an
+installed binary would silently remove this feature. The command directs users
+to this repository's releases instead.
+
 ## Files affected
 
 | Area | Files | Responsibility |
@@ -114,9 +123,22 @@ The focused suite covers:
 - streamed text, reasoning, tool calls, completion, and usage
 - local model capabilities
 - isolation from the Vercel model catalog
+- fork update-channel isolation
 
 Local verification also runs the built binary's `login --help` path to confirm
 the provider-specific CLI surface is linked into the executable.
+
+## Release packaging
+
+The release workflow recreates the patched source tree, builds ReleaseSafe
+binaries, reruns the focused tests on each native runner, and publishes:
+
+- `fx-linux-x86_64.tar.gz` from Ubuntu x86_64
+- `fx-macos-aarch64.tar.gz` from macOS arm64
+- a SHA-256 file beside each archive
+
+Each archive contains `fx`, `LICENSE`, and `THIRD_PARTY_NOTICES.md`. The macOS
+binary receives an ad-hoc code signature but is not Apple-notarized.
 
 ## Known limitations
 
