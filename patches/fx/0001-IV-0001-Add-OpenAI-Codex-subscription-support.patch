@@ -1,0 +1,2027 @@
+From cffb16ac79f0d845ecfbfc1537538ff42ff3fc95 Mon Sep 17 00:00:00 2001
+From: iamwrm <22743891+iamwrm@users.noreply.github.com>
+Date: Thu, 20 Aug 2026 12:07:39 +0900
+Subject: [PATCH] IV-0001 Add OpenAI Codex subscription support
+
+---
+ README.md                                 |   8 +
+ build.zig                                 |  17 +
+ src/builtins/commands.zig                 |   8 +-
+ src/builtins/gateway.zig                  |  31 +-
+ src/core/agent/runtime/gateway_step.zig   |   4 +
+ src/core/agent/runtime/image_provider.zig |   1 +
+ src/core/agent/runtime/orchestrator.zig   |   6 +-
+ src/core/agent/stream_provider.zig        |   3 +
+ src/core/auth/auth_runtime.zig            |  22 +-
+ src/core/auth/credentials.zig             |  92 ++-
+ src/core/auth/oauth_transport.zig         |   3 +
+ src/core/auth/openai_codex.zig            | 655 ++++++++++++++++++++++
+ src/core/cli/cli_surface.zig              |  66 ++-
+ src/core/config/model_capabilities.zig    |  25 +-
+ src/core/output/output_contracts.zig      |   3 +-
+ src/core/shared/types.zig                 |   1 +
+ src/gateway/openai_codex.zig              | 589 +++++++++++++++++++
+ src/openai_codex_test.zig                 |   5 +
+ src/ui/footer/model_menu_presentation.zig |   3 +-
+ 19 files changed, 1509 insertions(+), 33 deletions(-)
+ create mode 100644 src/core/auth/openai_codex.zig
+ create mode 100644 src/gateway/openai_codex.zig
+ create mode 100644 src/openai_codex_test.zig
+
+diff --git a/README.md b/README.md
+index fafac4d..50089b7 100644
+--- a/README.md
++++ b/README.md
+@@ -39,6 +39,14 @@ Or add an AI Gateway API key:
+ fx setup
+ ```
+ 
++To use an existing ChatGPT subscription through OpenAI Codex, run the device-code sign-in:
++
++```bash
++fx login openai-codex
++```
++
++This stores a refreshable OpenAI session in the fx profile and selects `openai-codex/gpt-5.6-sol`. Use `fx logout openai-codex` to remove it. Codex subscription requests go directly to the ChatGPT Codex Responses endpoint and are not sent through Vercel AI Gateway.
++
+ Run fx from a project:
+ 
+ ```bash
+diff --git a/build.zig b/build.zig
+index fd3d014..0ee02ff 100644
+--- a/build.zig
++++ b/build.zig
+@@ -90,6 +90,23 @@ pub fn build(b: *std.Build) void {
+     const test_step = b.step("test", "Run tests");
+     test_step.dependOn(&run_exe_tests.step);
+ 
++    const openai_codex_tests = b.addTest(.{
++        .root_module = b.createModule(.{
++            .root_source_file = b.path("src/openai_codex_test.zig"),
++            .target = target,
++            .optimize = optimize,
++            .link_libc = true,
++        }),
++        .filters = &.{"OpenAI Codex"},
++    });
++    openai_codex_tests.root_module.addImport("build_options", build_options.createModule());
++    const run_openai_codex_tests = b.addRunArtifact(openai_codex_tests);
++    const openai_codex_test_step = b.step(
++        "test-openai-codex",
++        "Run focused OpenAI Codex authentication and protocol tests",
++    );
++    openai_codex_test_step.dependOn(&run_openai_codex_tests.step);
++
+     if (wasm_surface != .none) {
+         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
+     }
+diff --git a/src/builtins/commands.zig b/src/builtins/commands.zig
+index e389e77..4cbfa2b 100644
+--- a/src/builtins/commands.zig
++++ b/src/builtins/commands.zig
+@@ -89,14 +89,14 @@ pub const top_level_specs = [_]TopLevelSpec{
+     .{
+         .kind = .login,
+         .token = "login",
+-        .usage = "login",
+-        .summary = "Sign in with Vercel",
++        .usage = "login [vercel|openai-codex]",
++        .summary = "Sign in with Vercel or OpenAI Codex",
+     },
+     .{
+         .kind = .logout,
+         .token = "logout",
+-        .usage = "logout",
+-        .summary = "Sign out of the current Vercel session",
++        .usage = "logout [vercel|openai-codex]",
++        .summary = "Sign out of a saved OAuth session",
+     },
+     .{
+         .kind = .setup,
+diff --git a/src/builtins/gateway.zig b/src/builtins/gateway.zig
+index adbfec1..361a224 100644
+--- a/src/builtins/gateway.zig
++++ b/src/builtins/gateway.zig
+@@ -26,6 +26,7 @@ const web_search_contract = @import("../core/tooling/web_search_contract.zig");
+ const web_search_policy = @import("../core/tooling/web_search_policy.zig");
+ const web_search_provider = @import("../core/tooling/web_search_provider.zig");
+ const gateway_schema = @import("../core/tooling/gateway_schema.zig");
++const openai_codex_gateway = @import("../gateway/openai_codex.zig");
+ const tool_advertisement = @import("../core/tooling/tool_advertisement.zig");
+ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
+ const sort_utils = @import("../core/shared/sort_utils.zig");
+@@ -144,6 +145,12 @@ pub fn buildAgentRequest(
+     alloc: Allocator,
+     request: agent_stream_provider_contract.BuildRequest,
+ ) anyerror![]u8 {
++    if (request.credential_source == .openai_codex) {
++        return openai_codex_gateway.buildRequest(alloc, request);
++    }
++    if (openai_codex_gateway.isModel(request.model)) {
++        return error.OpenAICodexCredentialRequired;
++    }
+     const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
+         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
+     else
+@@ -425,6 +432,18 @@ fn streamAgentCompletion(
+     alloc: Allocator,
+     request: agent_stream_provider_contract.Request,
+ ) anyerror!agent_stream_provider_contract.Result {
++    if (request.credential_source == .openai_codex) {
++        return openai_codex_gateway.stream(alloc, request) catch |err| {
++            request.attempt_evidence.network_failure = .{
++                .cause = .transport_interrupted,
++                .delivery = request.delivery.load(),
++            };
++            return err;
++        };
++    }
++    if (openai_codex_gateway.isModel(request.model)) {
++        return error.OpenAICodexCredentialRequired;
++    }
+     const result = gateway_client.streamGatewayCompletion(
+         alloc,
+         .{
+@@ -609,14 +628,15 @@ const OAuthHttpOperation = struct {
+             .location = .{ .url = self.request.url },
+             .method = switch (self.request.method) {
+                 .get => .GET,
+-                .post_form => .POST,
++                .post_form, .post_json => .POST,
+             },
+             .payload = self.request.payload,
+             .headers = .{
+-                .content_type = if (self.request.method == .post_form)
+-                    .{ .override = "application/x-www-form-urlencoded" }
+-                else
+-                    .default,
++                .content_type = switch (self.request.method) {
++                    .post_form => .{ .override = "application/x-www-form-urlencoded" },
++                    .post_json => .{ .override = "application/json" },
++                    .get => .default,
++                },
+                 .user_agent = .{ .override = gateway_client.user_agent },
+                 .accept_encoding = .omit,
+             },
+@@ -630,6 +650,7 @@ const OAuthHttpOperation = struct {
+ 
+         return .{
+             .disposition = if (result.status == .ok) .accepted else .rejected,
++            .status = result.status,
+             .body = try self.alloc.dupe(u8, body),
+         };
+     }
+diff --git a/src/core/agent/runtime/gateway_step.zig b/src/core/agent/runtime/gateway_step.zig
+index b399f2c..d2da01c 100644
+--- a/src/core/agent/runtime/gateway_step.zig
++++ b/src/core/agent/runtime/gateway_step.zig
+@@ -30,6 +30,7 @@ pub fn streamGatewayCompletion(
+     api_key: []const u8,
+     team: ?[]const u8,
+     session_id: ?[]const u8,
++    credential_source: ?types.CredentialSource,
+     model: []const u8,
+     retry_count: usize,
+     chat_url: []const u8,
+@@ -54,6 +55,7 @@ pub fn streamGatewayCompletion(
+     const usage_observation = try session_usage.GatewayObservation.begin(usage);
+     attempt_evidence.provider_admitted = true;
+     var result = provider.stream(alloc, .{
++        .credential_source = credential_source,
+         .api_key = api_key,
+         .team = team,
+         .session_id = session_id,
+@@ -346,6 +348,7 @@ test "pre-send gateway failure settles usage as unbilled" {
+         "test-key",
+         null,
+         null,
++        null,
+         "test/model",
+         1,
+         "not a valid URL",
+@@ -403,6 +406,7 @@ test "possibly sent gateway failure marks billing incomplete" {
+         "test-key",
+         null,
+         null,
++        null,
+         "test/model",
+         1,
+         "https://example.test/chat",
+diff --git a/src/core/agent/runtime/image_provider.zig b/src/core/agent/runtime/image_provider.zig
+index d151810..a4f0502 100644
+--- a/src/core/agent/runtime/image_provider.zig
++++ b/src/core/agent/runtime/image_provider.zig
+@@ -78,6 +78,7 @@ pub fn inspect(
+         request.api_key,
+         request.gateway_team,
+         request.session_id,
++        null,
+         model,
+         request.retry_count,
+         request.chat_url,
+diff --git a/src/core/agent/runtime/orchestrator.zig b/src/core/agent/runtime/orchestrator.zig
+index 57c7a7e..20ae72c 100644
+--- a/src/core/agent/runtime/orchestrator.zig
++++ b/src/core/agent/runtime/orchestrator.zig
+@@ -14,6 +14,7 @@ const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig
+ const io_mod = @import("../../shared/io.zig");
+ const host_target = @import("../../hosts/target.zig");
+ const secret = @import("../../auth/secret.zig");
++const credentials = @import("../../auth/credentials.zig");
+ const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+ const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+ const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
+@@ -1419,7 +1420,7 @@ fn refreshGatewayCredentialForJob(
+     trace_ctx: TraceContext,
+ ) !bool {
+     const source = job.credential_source orelse return false;
+-    if (source != .fx_login) return false;
++    if (!credentials.sourceRefreshable(source)) return false;
+     const refresh = deps.refresh_gateway_credential orelse return false;
+ 
+     const refreshed = refresh(deps.ctx, alloc, source, mode) catch |err| {
+@@ -2857,6 +2858,8 @@ fn processQueuedPromptLoop(
+             const request_payload = deps.agent_stream_provider.build(
+                 overlay_arena,
+                 .{
++                    .credential_source = job.credential_source,
++                    .session_id = lifecycle.scope.session_id,
+                     .model = gateway_model,
+                     .tool_registry = deps.tool_registry,
+                     .serialized_tools = config.gateway_tools_json,
+@@ -2933,6 +2936,7 @@ fn processQueuedPromptLoop(
+                 active_api_key,
+                 job.gateway_team,
+                 lifecycle.scope.session_id,
++                job.credential_source,
+                 gateway_model,
+                 config.gateway_retry_count,
+                 config.gateway_chat_url,
+diff --git a/src/core/agent/stream_provider.zig b/src/core/agent/stream_provider.zig
+index 740c953..e594d55 100644
+--- a/src/core/agent/stream_provider.zig
++++ b/src/core/agent/stream_provider.zig
+@@ -91,6 +91,8 @@ pub const StructuredResponseFormat = struct {
+ };
+ 
+ pub const BuildRequest = struct {
++    credential_source: ?types.CredentialSource = null,
++    session_id: ?[]const u8 = null,
+     model: []const u8,
+     tool_registry: tool_dispatch.Registry = .{},
+     serialized_tools: []const u8,
+@@ -106,6 +108,7 @@ pub const BuildRequest = struct {
+ };
+ 
+ pub const Request = struct {
++    credential_source: ?types.CredentialSource = null,
+     api_key: []const u8,
+     team: ?[]const u8,
+     /// Borrowed for the duration of `Provider.stream`.
+diff --git a/src/core/auth/auth_runtime.zig b/src/core/auth/auth_runtime.zig
+index 16bd150..2c6d56e 100644
+--- a/src/core/auth/auth_runtime.zig
++++ b/src/core/auth/auth_runtime.zig
+@@ -21,6 +21,7 @@ pub const CredentialRefreshMode = enum {
+ const credential_source_order = [_]credentials.Source{
+     .vercel_oidc_token,
+     .ai_gateway_api_key,
++    .openai_codex,
+     .fx_login,
+     .stored_key,
+ };
+@@ -95,7 +96,7 @@ pub const FailureSnapshot = struct {
+     }
+ };
+ 
+-/// Returns an owned token when the selected fx-login credential can be
++/// Returns an owned token when the selected OAuth credential can be
+ /// refreshed. The caller must release it with `secret.zeroAndFree`.
+ pub fn refreshFxLoginToken(
+     transport: oauth_transport.Provider,
+@@ -103,11 +104,16 @@ pub fn refreshFxLoginToken(
+     source: credentials.Source,
+     mode: CredentialRefreshMode,
+ ) !?[]u8 {
+-    if (source != .fx_login) return null;
+-
+-    var credential = switch (mode) {
+-        .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
+-        .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
++    var credential = switch (source) {
++        .fx_login => switch (mode) {
++            .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
++            .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
++        },
++        .openai_codex => switch (mode) {
++            .if_needed => (try credentials.loadOpenAICodexCredential(alloc, transport)) orelse return null,
++            .force => (try credentials.refreshOpenAICodexCredential(alloc, transport)) orelse return null,
++        },
++        else => return null,
+     };
+     defer credential.deinit(alloc);
+ 
+@@ -1122,9 +1128,9 @@ pub const Runtime = struct {
+ 
+     pub fn refreshFxLoginIfNeeded(self: *Self, alloc: Allocator) !bool {
+         const source = self.credentialSource() orelse return false;
+-        if (source != .fx_login) return false;
++        if (!credentials.sourceRefreshable(source)) return false;
+ 
+-        const loaded = (try credentials.loadFxLoginCredential(alloc, self.oauth_transport)) orelse {
++        const loaded = (try credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source)) orelse {
+             if (self.credentialNeedsRefresh()) return error.CredentialRefreshUnavailable;
+             return false;
+         };
+diff --git a/src/core/auth/credentials.zig b/src/core/auth/credentials.zig
+index d2f61e4..25a5fa5 100644
+--- a/src/core/auth/credentials.zig
++++ b/src/core/auth/credentials.zig
+@@ -4,6 +4,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
+ const host = @import("../hosts/host.zig");
+ const io_mod = @import("../shared/io.zig");
+ const oauth = @import("oauth.zig");
++const openai_codex = @import("openai_codex.zig");
+ const oauth_session = @import("oauth_session.zig");
+ const oauth_transport = @import("oauth_transport.zig");
+ const secret = @import("secret.zig");
+@@ -13,6 +14,7 @@ pub const Source = types.CredentialSource;
+ 
+ pub const CatalogPublicOnly = union(enum) {
+     no_credential,
++    direct_provider: Source,
+     fx_login_team_required,
+     fx_login_refresh_required,
+     credential_refresh_failed: Source,
+@@ -21,6 +23,7 @@ pub const CatalogPublicOnly = union(enum) {
+     fn credentialSource(self: CatalogPublicOnly) ?Source {
+         return switch (self) {
+             .no_credential => null,
++            .direct_provider => |source| source,
+             .fx_login_team_required, .fx_login_refresh_required => .fx_login,
+             .credential_refresh_failed => |source| source,
+             .authenticated_credential_rejected => |source| source,
+@@ -105,6 +108,9 @@ pub const CatalogAccess = union(enum) {
+ 
+ pub fn catalogAccessAt(credential: ?Credential, now_ms: i64) CatalogAccess {
+     const selected = credential orelse return .{ .public_only = .no_credential };
++    if (selected.source == .openai_codex) {
++        return .{ .public_only = .{ .direct_provider = .openai_codex } };
++    }
+     if (selected.source == .fx_login and selected.needsRefreshAt(now_ms)) {
+         return .{ .public_only = .fx_login_refresh_required };
+     }
+@@ -129,6 +135,9 @@ pub fn catalogAccessForCredential(
+     team_context: ?[]const u8,
+ ) CatalogAccess {
+     const selected_source = source orelse return .{ .public_only = .no_credential };
++    if (selected_source == .openai_codex) {
++        return .{ .public_only = .{ .direct_provider = .openai_codex } };
++    }
+     const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
+         .vercel_oidc_token => .vercel_oidc_token,
+         .ai_gateway_api_key => .ai_gateway_api_key,
+@@ -140,6 +149,7 @@ pub fn catalogAccessForCredential(
+                 return .{ .public_only = .fx_login_team_required };
+             break :blk .fx_login;
+         },
++        .openai_codex => unreachable,
+     };
+     return .{
+         .authenticated = .{
+@@ -155,7 +165,7 @@ pub fn catalogAccessForCredential(
+ pub const stored_key_backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
+ 
+ /// Both modes resolve the same source set; the mode selects only whether an expired
+-/// fx login session is refreshed first.
++/// OAuth session is refreshed first.
+ pub const LoadMode = enum { stored, refresh_if_needed };
+ 
+ const FxLoginRefreshMode = enum { if_needed, force };
+@@ -243,6 +253,12 @@ pub fn resolvePreferring(
+     };
+     if (fx_login) |credential| return .{ .credential = credential };
+ 
++    const openai_login = switch (mode) {
++        .stored => try loadStoredOpenAICodexCredential(alloc),
++        .refresh_if_needed => try loadOpenAICodexCredential(alloc, transport),
++    };
++    if (openai_login) |credential| return .{ .credential = credential };
++
+     if (secret_store.isDisabled()) return .{};
+ 
+     var status: StoredKeyReadStatus = .not_found;
+@@ -256,7 +272,7 @@ pub fn resolvePreferring(
+     return .{ .stored_key_status = status };
+ }
+ 
+-/// `loadSource` always refreshes an expired fx login, which `.stored` mode
++/// `loadSource` always refreshes an expired OAuth login, which `.stored` mode
+ /// forbids: a diagnostic must not rewrite the session file or make an OAuth
+ /// request. Honour the mode for the preferred source too.
+ fn loadPreferredSource(
+@@ -266,10 +282,16 @@ fn loadPreferredSource(
+     mode: LoadMode,
+     source: Source,
+ ) !?Credential {
+-    if (source != .fx_login) return loadSource(alloc, transport, secret_store, source);
+-    return switch (mode) {
+-        .stored => loadStoredFxLoginCredential(alloc),
+-        .refresh_if_needed => loadFxLoginCredential(alloc, transport),
++    return switch (source) {
++        .fx_login => switch (mode) {
++            .stored => loadStoredFxLoginCredential(alloc),
++            .refresh_if_needed => loadFxLoginCredential(alloc, transport),
++        },
++        .openai_codex => switch (mode) {
++            .stored => loadStoredOpenAICodexCredential(alloc),
++            .refresh_if_needed => loadOpenAICodexCredential(alloc, transport),
++        },
++        else => loadSource(alloc, transport, secret_store, source),
+     };
+ }
+ 
+@@ -282,6 +304,7 @@ pub fn loadSource(
+     return switch (source) {
+         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
+         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
++        .openai_codex => loadOpenAICodexCredential(alloc, transport),
+         .fx_login => loadFxLoginCredential(alloc, transport),
+         .stored_key => loadStoredKeyCredential(alloc, secret_store),
+     };
+@@ -295,6 +318,7 @@ pub fn sourceExists(
+     return switch (source) {
+         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
+         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
++        .openai_codex => openai_codex.exists(alloc),
+         .fx_login => blk: {
+             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
+                 error.OutOfMemory => return err,
+@@ -465,23 +489,61 @@ fn credentialRefreshAfterMs(expires_at_ms: i64, refreshed_at_ms: ?i64) i64 {
+     return expires_at_ms;
+ }
+ 
++pub fn loadOpenAICodexCredential(
++    alloc: std.mem.Allocator,
++    transport: oauth_transport.Provider,
++) !?Credential {
++    var access = (try openai_codex.loadAccess(alloc, transport)) orelse return null;
++    defer access.deinit(alloc);
++    return takeOpenAICodexCredential(&access);
++}
++
++fn loadStoredOpenAICodexCredential(alloc: std.mem.Allocator) !?Credential {
++    var access = (try openai_codex.loadStoredAccess(alloc)) orelse return null;
++    defer access.deinit(alloc);
++    return takeOpenAICodexCredential(&access);
++}
++
++pub fn refreshOpenAICodexCredential(
++    alloc: std.mem.Allocator,
++    transport: oauth_transport.Provider,
++) !?Credential {
++    var access = (try openai_codex.refreshAccess(alloc, transport)) orelse return null;
++    defer access.deinit(alloc);
++    return takeOpenAICodexCredential(&access);
++}
++
++fn takeOpenAICodexCredential(access: *openai_codex.Access) Credential {
++    const token = access.token;
++    access.token = &.{};
++    const account_id = access.account_id;
++    access.account_id = &.{};
++    return .{
++        .token = token,
++        .source = .openai_codex,
++        .team_id = account_id,
++        .refresh_after_ms = access.refresh_after_ms,
++    };
++}
++
+ pub fn sourceLabel(source: Source) []const u8 {
+     return switch (source) {
+         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
+         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
++        .openai_codex => "OpenAI Codex subscription",
+         .fx_login => "fx login",
+         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+     };
+ }
+ 
+ pub fn sourceRefreshable(source: Source) bool {
+-    return source == .fx_login;
++    return source == .fx_login or source == .openai_codex;
+ }
+ 
+ test "stored key label discloses the backend that answered" {
+     try std.testing.expect(std.mem.find(u8, sourceLabel(.stored_key), stored_key_backend_label) != null);
+     try std.testing.expect(std.mem.find(u8, unreadable_store_message, stored_key_backend_label) != null);
+-    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login }) |source| {
++    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .openai_codex, .fx_login }) |source| {
+         try std.testing.expect(!std.mem.eql(u8, sourceLabel(source), sourceLabel(.stored_key)));
+     }
+ }
+@@ -532,6 +594,20 @@ test "public-only catalog access never permits authorization or team context" {
+     try std.testing.expect(rejected.teamContext() == null);
+ }
+ 
++test "OpenAI Codex credentials stay off the AI Gateway catalog request" {
++    var credential = Credential{
++        .token = try std.testing.allocator.dupe(u8, "subscription-token"),
++        .source = .openai_codex,
++        .team_id = try std.testing.allocator.dupe(u8, "account-id"),
++    };
++    defer credential.deinit(std.testing.allocator);
++    const access = catalogAccessAt(credential, 0);
++    try std.testing.expectEqual(Source.openai_codex, access.credentialSource().?);
++    try std.testing.expectEqual(CatalogPublicOnlyReason.direct_provider, access.publicOnlyReason().?);
++    try std.testing.expect(access.authorizationCredential() == null);
++    try std.testing.expect(access.teamContext() == null);
++}
++
+ test "selected fx login authorizes its team model catalog" {
+     var login = Credential{
+         .token = try std.testing.allocator.dupe(u8, "login-token"),
+diff --git a/src/core/auth/oauth_transport.zig b/src/core/auth/oauth_transport.zig
+index ee57c00..541a219 100644
+--- a/src/core/auth/oauth_transport.zig
++++ b/src/core/auth/oauth_transport.zig
+@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
+ pub const Method = enum {
+     get,
+     post_form,
++    post_json,
+ };
+ 
+ pub const Request = struct {
+@@ -23,6 +24,7 @@ pub const Disposition = enum {
+ 
+ pub const Response = struct {
+     disposition: Disposition,
++    status: std.http.Status = .ok,
+     /// Owned bytes allocated with the allocator passed to `Provider.execute`.
+     body: []u8,
+ 
+@@ -30,6 +32,7 @@ pub const Response = struct {
+         secret.zeroAndFree(alloc, self.body);
+         self.* = .{
+             .disposition = .rejected,
++            .status = .internal_server_error,
+             .body = &.{},
+         };
+     }
+diff --git a/src/core/auth/openai_codex.zig b/src/core/auth/openai_codex.zig
+new file mode 100644
+index 0000000..3bae2bf
+--- /dev/null
++++ b/src/core/auth/openai_codex.zig
+@@ -0,0 +1,655 @@
++const std = @import("std");
++const debug_trace = @import("../shared/debug_trace.zig");
++const host = @import("../hosts/host.zig");
++const host_target = @import("../hosts/target.zig");
++const io_mod = @import("../shared/io.zig");
++const oauth_transport = @import("oauth_transport.zig");
++const profile_paths = @import("../shared/profile_paths.zig");
++const secret = @import("secret.zig");
++
++const Allocator = std.mem.Allocator;
++
++pub const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
++pub const default_model = "openai-codex/gpt-5.6-sol";
++pub const verification_uri = "https://auth.openai.com/codex/device";
++const user_code_url = "https://auth.openai.com/api/accounts/deviceauth/usercode";
++const device_token_url = "https://auth.openai.com/api/accounts/deviceauth/token";
++const token_url = "https://auth.openai.com/oauth/token";
++const redirect_uri = "https://auth.openai.com/deviceauth/callback";
++const auth_file_name = "openai-codex-auth.json";
++const lock_file_name = "openai-codex-auth.lock";
++const max_auth_file_bytes: usize = 64 * 1024;
++const mutation_lock_deadline_ms: u64 = 2000;
++const device_timeout_ms: i64 = 15 * 60 * std.time.ms_per_s;
++const expiry_skew_ms: i64 = 5 * 60 * std.time.ms_per_s;
++
++pub const AuthError = error{
++    InvalidResponse,
++    AuthorizationDenied,
++    AuthorizationExpired,
++    AuthorizationPending,
++    SlowDown,
++    RequestFailed,
++    AccountIdMissing,
++};
++
++pub const Access = struct {
++    token: []u8,
++    account_id: []u8,
++    refresh_after_ms: i64,
++
++    pub fn deinit(self: *Access, alloc: Allocator) void {
++        secret.zeroAndFree(alloc, self.token);
++        if (self.account_id.len > 0) alloc.free(self.account_id);
++        self.* = undefined;
++    }
++};
++
++const Session = struct {
++    access_token: []u8,
++    refresh_token: []u8,
++    expires_at_ms: i64,
++
++    fn deinit(self: *Session, alloc: Allocator) void {
++        secret.zeroAndFree(alloc, self.access_token);
++        secret.zeroAndFree(alloc, self.refresh_token);
++        self.* = undefined;
++    }
++
++    fn expired(self: Session, now_ms: i64) bool {
++        return refreshDeadlineMs(self.expires_at_ms) <= now_ms;
++    }
++};
++
++const Mutation = struct {
++    fx_dir: io_mod.VerifiedDir,
++    lock: io_mod.TimedAdvisoryLock,
++
++    fn deinit(self: *Mutation) void {
++        self.lock.release();
++        self.fx_dir.close();
++        self.* = undefined;
++    }
++
++    fn load(self: *Mutation, alloc: Allocator) !?Session {
++        return loadFromDir(alloc, &self.fx_dir.dir, true);
++    }
++
++    fn save(self: *Mutation, alloc: Allocator, session: Session) !void {
++        const text = try stringify(alloc, session);
++        defer secret.zeroAndFree(alloc, text);
++        try io_mod.durableReplaceVerified(alloc, &self.fx_dir, auth_file_name, text);
++    }
++
++    fn delete(self: *Mutation) !bool {
++        self.fx_dir.dir.deleteFile(io_mod.getIo(), auth_file_name) catch |err| switch (err) {
++            error.FileNotFound => return false,
++            else => return err,
++        };
++        io_mod.syncVerifiedDir(self.fx_dir.dir) catch |err| switch (err) {
++            error.OperationUnsupported => {},
++            else => return err,
++        };
++        return true;
++    }
++};
++
++const DeviceAuthorization = struct {
++    device_auth_id: []u8,
++    user_code: []u8,
++    interval_seconds: u64,
++
++    fn deinit(self: *DeviceAuthorization, alloc: Allocator) void {
++        secret.zeroAndFree(alloc, self.device_auth_id);
++        alloc.free(self.user_code);
++        self.* = undefined;
++    }
++};
++
++const DeviceGrant = struct {
++    authorization_code: []u8,
++    code_verifier: []u8,
++
++    fn deinit(self: *DeviceGrant, alloc: Allocator) void {
++        secret.zeroAndFree(alloc, self.authorization_code);
++        secret.zeroAndFree(alloc, self.code_verifier);
++        self.* = undefined;
++    }
++};
++
++const TokenSet = struct {
++    access_token: []u8,
++    refresh_token: []u8,
++    expires_in: i64,
++
++    fn deinit(self: *TokenSet, alloc: Allocator) void {
++        secret.zeroAndFree(alloc, self.access_token);
++        secret.zeroAndFree(alloc, self.refresh_token);
++        self.* = undefined;
++    }
++};
++
++const PollResult = union(enum) {
++    pending,
++    slow_down,
++    complete: DeviceGrant,
++};
++
++const RemoteError = enum {
++    pending,
++    slow_down,
++    denied,
++    expired,
++    unknown,
++};
++
++pub fn runLogin(
++    alloc: Allocator,
++    transport: oauth_transport.Provider,
++    url_opener: host.UrlOpener,
++) !void {
++    if (comptime host_target.is_wasm) return error.OpenAICodexUnavailable;
++
++    var device = try requestDeviceAuthorization(alloc, transport);
++    defer device.deinit(alloc);
++
++    try writeStdout("Open ");
++    try writeStdout(verification_uri);
++    try writeStdout("\nCode: ");
++    try writeStdout(device.user_code);
++    try writeStdout("\n\nWaiting for OpenAI authorization...\n");
++    _ = url_opener.open(alloc, verification_uri) catch false;
++
++    const started_ms = io_mod.milliTimestamp();
++    var interval_seconds = @max(device.interval_seconds, 1);
++    var grant: DeviceGrant = while (true) {
++        if (io_mod.milliTimestamp() - started_ms >= device_timeout_ms) {
++            return AuthError.AuthorizationExpired;
++        }
++        io_mod.sleep(interval_seconds *| std.time.ns_per_s);
++        switch (try pollDeviceAuthorization(alloc, transport, device)) {
++            .pending => {},
++            .slow_down => interval_seconds = @min(interval_seconds +| 5, 30),
++            .complete => |value| break value,
++        }
++    };
++    defer grant.deinit(alloc);
++
++    var token = try exchangeAuthorizationCode(alloc, transport, grant);
++    defer token.deinit(alloc);
++    const account_id = try accountIdFromAccessToken(alloc, token.access_token);
++    defer alloc.free(account_id);
++
++    var session = Session{
++        .access_token = token.access_token,
++        .refresh_token = token.refresh_token,
++        .expires_at_ms = try expiryTimestampMs(io_mod.milliTimestamp(), token.expires_in),
++    };
++    token.access_token = &.{};
++    token.refresh_token = &.{};
++    defer session.deinit(alloc);
++    try saveNewSession(alloc, session);
++    try writeStdout("Signed in to OpenAI Codex.\n");
++}
++
++pub fn loadAccess(
++    alloc: Allocator,
++    transport: oauth_transport.Provider,
++) !?Access {
++    var session = (try load(alloc)) orelse return null;
++    defer session.deinit(alloc);
++    if (session.expired(io_mod.milliTimestamp())) {
++        return refreshAccessLocked(alloc, transport, false);
++    }
++    return @as(?Access, try takeAccess(alloc, &session));
++}
++
++pub fn loadStoredAccess(alloc: Allocator) !?Access {
++    var session = (try load(alloc)) orelse return null;
++    defer session.deinit(alloc);
++    return @as(?Access, try takeAccess(alloc, &session));
++}
++
++pub fn refreshAccess(
++    alloc: Allocator,
++    transport: oauth_transport.Provider,
++) !?Access {
++    return refreshAccessLocked(alloc, transport, true);
++}
++
++pub fn exists(alloc: Allocator) !bool {
++    var session = (try load(alloc)) orelse return false;
++    defer session.deinit(alloc);
++    return true;
++}
++
++pub fn logout() !bool {
++    if (comptime host_target.is_wasm) return false;
++    var mutation = (try beginExistingMutation()) orelse return false;
++    defer mutation.deinit();
++    return mutation.delete();
++}
++
++fn refreshAccessLocked(
++    alloc: Allocator,
++    transport: oauth_transport.Provider,
++    force: bool,
++) !?Access {
++    var mutation = (try beginExistingMutation()) orelse return null;
++    defer mutation.deinit();
++    var session = (try mutation.load(alloc)) orelse return null;
++    defer session.deinit(alloc);
++
++    if (force or session.expired(io_mod.milliTimestamp())) {
++        var token = try refreshToken(alloc, transport, session.refresh_token);
++        defer token.deinit(alloc);
++        secret.zeroAndFree(alloc, session.access_token);
++        session.access_token = token.access_token;
++        token.access_token = &.{};
++        secret.zeroAndFree(alloc, session.refresh_token);
++        session.refresh_token = token.refresh_token;
++        token.refresh_token = &.{};
++        session.expires_at_ms = try expiryTimestampMs(io_mod.milliTimestamp(), token.expires_in);
++        try mutation.save(alloc, session);
++    }
++    return @as(?Access, try takeAccess(alloc, &session));
++}
++
++fn takeAccess(alloc: Allocator, session: *Session) !Access {
++    const account_id = try accountIdFromAccessToken(alloc, session.access_token);
++    errdefer alloc.free(account_id);
++    const token = session.access_token;
++    session.access_token = &.{};
++    return .{
++        .token = token,
++        .account_id = account_id,
++        .refresh_after_ms = refreshDeadlineMs(session.expires_at_ms),
++    };
++}
++
++fn refreshDeadlineMs(expires_at_ms: i64) i64 {
++    return expires_at_ms -| expiry_skew_ms;
++}
++
++fn expiryTimestampMs(now_ms: i64, expires_in_seconds: i64) AuthError!i64 {
++    if (expires_in_seconds <= 0) return AuthError.InvalidResponse;
++    const duration_ms = std.math.mul(i64, expires_in_seconds, std.time.ms_per_s) catch
++        return AuthError.InvalidResponse;
++    return std.math.add(i64, now_ms, duration_ms) catch AuthError.InvalidResponse;
++}
++
++fn requestDeviceAuthorization(
++    alloc: Allocator,
++    transport: oauth_transport.Provider,
++) !DeviceAuthorization {
++    const payload = "{\"client_id\":\"" ++ client_id ++ "\"}";
++    var response = try transport.execute(alloc, .{
++        .method = .post_json,
++        .url = user_code_url,
++        .payload = payload,
++    });
++    defer response.deinit(alloc);
++    if (response.disposition != .accepted) return AuthError.RequestFailed;
++    return parseDeviceAuthorization(alloc, response.body);
++}
++
++fn pollDeviceAuthorization(
++    alloc: Allocator,
++    transport: oauth_transport.Provider,
++    device: DeviceAuthorization,
++) !PollResult {
++    var payload_writer: std.Io.Writer.Allocating = .init(alloc);
++    defer payload_writer.deinit();
++    try payload_writer.writer.writeAll("{\"device_auth_id\":");
++    try std.json.Stringify.value(device.device_auth_id, .{}, &payload_writer.writer);
++    try payload_writer.writer.writeAll(",\"user_code\":");
++    try std.json.Stringify.value(device.user_code, .{}, &payload_writer.writer);
++    try payload_writer.writer.writeByte('}');
++
++    var response = try transport.execute(alloc, .{
++        .method = .post_json,
++        .url = device_token_url,
++        .payload = payload_writer.written(),
++    });
++    defer response.deinit(alloc);
++    if (response.disposition == .accepted) {
++        return .{ .complete = try parseDeviceGrant(alloc, response.body) };
++    }
++    if (response.status == .forbidden or response.status == .not_found) return .pending;
++    switch (parseRemoteError(alloc, response.body) catch .unknown) {
++        .pending => return .pending,
++        .slow_down => return .slow_down,
++        .denied => return AuthError.AuthorizationDenied,
++        .expired => return AuthError.AuthorizationExpired,
++        .unknown => {},
++    }
++    return AuthError.RequestFailed;
++}
++
++fn exchangeAuthorizationCode(
++    alloc: Allocator,
++    transport: oauth_transport.Provider,
++    grant: DeviceGrant,
++) !TokenSet {
++    var form: std.Io.Writer.Allocating = .init(alloc);
++    defer form.deinit();
++    var first = true;
++    try appendForm(&form.writer, &first, "grant_type", "authorization_code");
++    try appendForm(&form.writer, &first, "client_id", client_id);
++    try appendForm(&form.writer, &first, "code", grant.authorization_code);
++    try appendForm(&form.writer, &first, "code_verifier", grant.code_verifier);
++    try appendForm(&form.writer, &first, "redirect_uri", redirect_uri);
++    return requestToken(alloc, transport, form.written());
++}
++
++fn refreshToken(
++    alloc: Allocator,
++    transport: oauth_transport.Provider,
++    refresh_token: []const u8,
++) !TokenSet {
++    var form: std.Io.Writer.Allocating = .init(alloc);
++    defer form.deinit();
++    var first = true;
++    try appendForm(&form.writer, &first, "grant_type", "refresh_token");
++    try appendForm(&form.writer, &first, "refresh_token", refresh_token);
++    try appendForm(&form.writer, &first, "client_id", client_id);
++    return requestToken(alloc, transport, form.written());
++}
++
++fn requestToken(
++    alloc: Allocator,
++    transport: oauth_transport.Provider,
++    payload: []const u8,
++) !TokenSet {
++    var response = try transport.execute(alloc, .{
++        .method = .post_form,
++        .url = token_url,
++        .payload = payload,
++    });
++    defer response.deinit(alloc);
++    if (response.disposition != .accepted) return AuthError.RequestFailed;
++    return parseTokenSet(alloc, response.body);
++}
++
++fn parseDeviceAuthorization(alloc: Allocator, bytes: []const u8) !DeviceAuthorization {
++    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
++    defer parsed.deinit();
++    if (parsed.value != .object) return AuthError.InvalidResponse;
++    const object = parsed.value.object;
++    const device_auth_id = try dupeRequiredString(alloc, object, "device_auth_id");
++    errdefer secret.zeroAndFree(alloc, device_auth_id);
++    const user_code = try dupeRequiredString(alloc, object, "user_code");
++    errdefer alloc.free(user_code);
++    const interval = object.get("interval") orelse return AuthError.InvalidResponse;
++    const interval_seconds: u64 = switch (interval) {
++        .integer => |value| if (value >= 0) @intCast(value) else return AuthError.InvalidResponse,
++        .string => |value| std.fmt.parseUnsigned(u64, std.mem.trim(u8, value, " \t\r\n"), 10) catch
++            return AuthError.InvalidResponse,
++        else => return AuthError.InvalidResponse,
++    };
++    return .{
++        .device_auth_id = device_auth_id,
++        .user_code = user_code,
++        .interval_seconds = interval_seconds,
++    };
++}
++
++fn parseDeviceGrant(alloc: Allocator, bytes: []const u8) !DeviceGrant {
++    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
++    defer parsed.deinit();
++    if (parsed.value != .object) return AuthError.InvalidResponse;
++    const authorization_code = try dupeRequiredString(alloc, parsed.value.object, "authorization_code");
++    errdefer secret.zeroAndFree(alloc, authorization_code);
++    return .{
++        .authorization_code = authorization_code,
++        .code_verifier = try dupeRequiredString(alloc, parsed.value.object, "code_verifier"),
++    };
++}
++
++fn parseTokenSet(alloc: Allocator, bytes: []const u8) !TokenSet {
++    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
++    defer parsed.deinit();
++    if (parsed.value != .object) return AuthError.InvalidResponse;
++    const object = parsed.value.object;
++    const access_token = try dupeRequiredString(alloc, object, "access_token");
++    errdefer secret.zeroAndFree(alloc, access_token);
++    const refresh_token = try dupeRequiredString(alloc, object, "refresh_token");
++    errdefer secret.zeroAndFree(alloc, refresh_token);
++    const expires = object.get("expires_in") orelse return AuthError.InvalidResponse;
++    if (expires != .integer or expires.integer <= 0) return AuthError.InvalidResponse;
++    return .{
++        .access_token = access_token,
++        .refresh_token = refresh_token,
++        .expires_in = expires.integer,
++    };
++}
++
++fn parseRemoteError(alloc: Allocator, bytes: []const u8) !RemoteError {
++    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
++    defer parsed.deinit();
++    if (parsed.value != .object) return .unknown;
++    const error_value = parsed.value.object.get("error") orelse return .unknown;
++    const code: ?[]const u8 = switch (error_value) {
++        .string => |value| value,
++        .object => |object| blk: {
++            const code = object.get("code") orelse break :blk null;
++            break :blk if (code == .string) code.string else null;
++        },
++        else => null,
++    };
++    const value = code orelse return .unknown;
++    if (std.mem.eql(u8, value, "deviceauth_authorization_pending")) return .pending;
++    if (std.mem.eql(u8, value, "slow_down")) return .slow_down;
++    if (std.mem.eql(u8, value, "access_denied")) return .denied;
++    if (std.mem.eql(u8, value, "expired_token")) return .expired;
++    return .unknown;
++}
++
++fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
++    const value = object.get(key) orelse return AuthError.InvalidResponse;
++    if (value != .string or value.string.len == 0) return AuthError.InvalidResponse;
++    return alloc.dupe(u8, value.string);
++}
++
++fn appendForm(
++    writer: *std.Io.Writer,
++    first: *bool,
++    key: []const u8,
++    value: []const u8,
++) !void {
++    if (!first.*) try writer.writeByte('&');
++    first.* = false;
++    try percentEncode(writer, key);
++    try writer.writeByte('=');
++    try percentEncode(writer, value);
++}
++
++fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
++    const hex = "0123456789ABCDEF";
++    for (value) |byte| {
++        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~') {
++            try writer.writeByte(byte);
++        } else {
++            try writer.writeByte('%');
++            try writer.writeByte(hex[byte >> 4]);
++            try writer.writeByte(hex[byte & 0x0f]);
++        }
++    }
++}
++
++pub fn accountIdFromAccessToken(alloc: Allocator, token: []const u8) ![]u8 {
++    var parts = std.mem.splitScalar(u8, token, '.');
++    _ = parts.next() orelse return AuthError.AccountIdMissing;
++    const encoded = parts.next() orelse return AuthError.AccountIdMissing;
++    _ = parts.next() orelse return AuthError.AccountIdMissing;
++    if (parts.next() != null) return AuthError.AccountIdMissing;
++
++    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(encoded) catch
++        return AuthError.AccountIdMissing;
++    const decoded = try alloc.alloc(u8, decoded_len);
++    defer alloc.free(decoded);
++    std.base64.url_safe_no_pad.Decoder.decode(decoded, encoded) catch
++        return AuthError.AccountIdMissing;
++    var parsed = std.json.parseFromSlice(std.json.Value, alloc, decoded, .{}) catch
++        return AuthError.AccountIdMissing;
++    defer parsed.deinit();
++    if (parsed.value != .object) return AuthError.AccountIdMissing;
++    const auth = parsed.value.object.get("https://api.openai.com/auth") orelse
++        return AuthError.AccountIdMissing;
++    if (auth != .object) return AuthError.AccountIdMissing;
++    const account_id = auth.object.get("chatgpt_account_id") orelse
++        return AuthError.AccountIdMissing;
++    if (account_id != .string or account_id.string.len == 0) return AuthError.AccountIdMissing;
++    return alloc.dupe(u8, account_id.string);
++}
++
++fn load(alloc: Allocator) !?Session {
++    if (comptime host_target.is_wasm) return null;
++    const home = io_mod.getenv("HOME") orelse return null;
++    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch return null;
++    defer home_dir.close(io_mod.getIo());
++    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
++        .iterate = true,
++        .follow_symlinks = false,
++    }) catch return null;
++    defer fx_dir.close(io_mod.getIo());
++    return loadFromDir(alloc, &fx_dir, false);
++}
++
++fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, report_errors: bool) !?Session {
++    var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
++        .mode = .read_only,
++        .allow_directory = false,
++        .follow_symlinks = false,
++        .resolve_beneath = true,
++    }) catch |err| switch (err) {
++        error.FileNotFound => return null,
++        else => if (report_errors) return err else return null,
++    };
++    defer file.close(io_mod.getIo());
++    const stat = try file.stat(io_mod.getIo());
++    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
++        if (report_errors) return error.InsecureAuthFile;
++        return null;
++    }
++    const bytes = try io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes);
++    defer secret.zeroAndFree(alloc, bytes);
++    return parseSession(alloc, bytes) catch |err| {
++        if (err == error.OutOfMemory or report_errors) return err;
++        debug_trace.logf("auth", "OpenAI Codex session parse failed err={s}", .{@errorName(err)});
++        return null;
++    };
++}
++
++fn saveNewSession(alloc: Allocator, session: Session) !void {
++    var mutation = try beginMutation();
++    defer mutation.deinit();
++    try mutation.save(alloc, session);
++}
++
++fn beginMutation() !Mutation {
++    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
++    var home_dir = io_mod.VerifiedDir{
++        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
++    };
++    defer home_dir.close();
++    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
++    errdefer fx_dir.close();
++    const lock = try io_mod.acquireTimedAdvisoryLock(&fx_dir, lock_file_name, mutation_lock_deadline_ms);
++    return .{ .fx_dir = fx_dir, .lock = lock };
++}
++
++fn beginExistingMutation() !?Mutation {
++    if (comptime host_target.is_wasm) return null;
++    const home = io_mod.getenv("HOME") orelse return null;
++    var home_dir = io_mod.VerifiedDir{
++        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
++    };
++    defer home_dir.close();
++    var fx_dir = home_dir.dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
++        .iterate = true,
++        .follow_symlinks = false,
++    }) catch |err| switch (err) {
++        error.FileNotFound => return null,
++        else => return err,
++    };
++    errdefer fx_dir.close(io_mod.getIo());
++    const stat = try fx_dir.stat(io_mod.getIo());
++    if (stat.kind != .directory) return error.DurablePathUnsafe;
++    try fx_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
++    var verified = io_mod.VerifiedDir{ .dir = fx_dir };
++    errdefer verified.close();
++    const lock = try io_mod.acquireTimedAdvisoryLock(&verified, lock_file_name, mutation_lock_deadline_ms);
++    return .{ .fx_dir = verified, .lock = lock };
++}
++
++fn parseSession(alloc: Allocator, bytes: []const u8) !Session {
++    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
++    defer parsed.deinit();
++    if (parsed.value != .object) return AuthError.InvalidResponse;
++    const object = parsed.value.object;
++    const version = object.get("version") orelse return AuthError.InvalidResponse;
++    if (version != .integer or version.integer != 1) return AuthError.InvalidResponse;
++    const access_token = try dupeRequiredString(alloc, object, "access_token");
++    errdefer secret.zeroAndFree(alloc, access_token);
++    const refresh_token = try dupeRequiredString(alloc, object, "refresh_token");
++    errdefer secret.zeroAndFree(alloc, refresh_token);
++    const expires = object.get("expires_at_ms") orelse return AuthError.InvalidResponse;
++    if (expires != .integer) return AuthError.InvalidResponse;
++    return .{
++        .access_token = access_token,
++        .refresh_token = refresh_token,
++        .expires_at_ms = expires.integer,
++    };
++}
++
++fn stringify(alloc: Allocator, session: Session) ![]u8 {
++    var out: std.Io.Writer.Allocating = .init(alloc);
++    errdefer out.deinit();
++    try out.writer.writeAll("{\"version\":1,\"access_token\":");
++    try std.json.Stringify.value(session.access_token, .{}, &out.writer);
++    try out.writer.writeAll(",\"refresh_token\":");
++    try std.json.Stringify.value(session.refresh_token, .{}, &out.writer);
++    try out.writer.print(",\"expires_at_ms\":{d}}}\n", .{session.expires_at_ms});
++    return out.toOwnedSlice();
++}
++
++fn writeStdout(text: []const u8) !void {
++    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
++}
++
++test "OpenAI Codex device response accepts string intervals" {
++    var device = try parseDeviceAuthorization(
++        std.testing.allocator,
++        "{\"device_auth_id\":\"device\",\"user_code\":\"ABCD-EFGH\",\"interval\":\"7\"}",
++    );
++    defer device.deinit(std.testing.allocator);
++    try std.testing.expectEqual(@as(u64, 7), device.interval_seconds);
++}
++
++test "OpenAI Codex account id is extracted from the access token" {
++    const payload = "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_test\"}}";
++    var encoded_buf: [256]u8 = undefined;
++    const encoded = std.base64.url_safe_no_pad.Encoder.encode(&encoded_buf, payload);
++    const token = try std.fmt.allocPrint(std.testing.allocator, "header.{s}.signature", .{encoded});
++    defer std.testing.allocator.free(token);
++    const account_id = try accountIdFromAccessToken(std.testing.allocator, token);
++    defer std.testing.allocator.free(account_id);
++    try std.testing.expectEqualStrings("acct_test", account_id);
++}
++
++test "OpenAI Codex sessions round trip" {
++    var session = Session{
++        .access_token = try std.testing.allocator.dupe(u8, "access"),
++        .refresh_token = try std.testing.allocator.dupe(u8, "refresh"),
++        .expires_at_ms = 1234,
++    };
++    defer session.deinit(std.testing.allocator);
++    const text = try stringify(std.testing.allocator, session);
++    defer secret.zeroAndFree(std.testing.allocator, text);
++    var parsed = try parseSession(std.testing.allocator, text);
++    defer parsed.deinit(std.testing.allocator);
++    try std.testing.expectEqualStrings("access", parsed.access_token);
++    try std.testing.expectEqualStrings("refresh", parsed.refresh_token);
++    try std.testing.expectEqual(@as(i64, 1234), parsed.expires_at_ms);
++}
+diff --git a/src/core/cli/cli_surface.zig b/src/core/cli/cli_surface.zig
+index 06c37a4..1697a58 100644
+--- a/src/core/cli/cli_surface.zig
++++ b/src/core/cli/cli_surface.zig
+@@ -21,6 +21,7 @@ const github_publish = @import("../github/github_publish.zig");
+ const github_workflows = @import("../github/github_workflows.zig");
+ const host = @import("../hosts/host.zig");
+ const login_flow = @import("../auth/login_flow.zig");
++const openai_codex = @import("../auth/openai_codex.zig");
+ const oauth_transport = @import("../auth/oauth_transport.zig");
+ const secret = @import("../auth/secret.zig");
+ const output_contracts = @import("../output/output_contracts.zig");
+@@ -723,8 +724,39 @@ fn runNonInteractiveWithDeps(
+         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
+         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
+         .login => |rest| {
+-            if (rest.len != 0) {
+-                try writeStderr(deps, "usage: fx login\n");
++            if (rest.len > 1) {
++                try writeStderr(deps, "usage: fx login [vercel|openai-codex]\n");
++                return .handled_failure;
++            }
++            if (rest.len == 1 and
++                (std.mem.eql(u8, rest[0], "openai-codex") or std.mem.eql(u8, rest[0], "codex")))
++            {
++                openai_codex.runLogin(
++                    alloc,
++                    cfg.gateway_provider.oauth_transport,
++                    cfg.url_opener,
++                ) catch |err| {
++                    const message = switch (err) {
++                        error.AuthorizationDenied => "fx login openai-codex: authorization denied\n",
++                        error.AuthorizationExpired => "fx login openai-codex: authorization expired; run the command again\n",
++                        else => "fx login openai-codex: failed to sign in\n",
++                    };
++                    try writeStderr(deps, message);
++                    return .handled_failure;
++                };
++                var attempt = config_runtime.attemptUserPreferences(alloc, .{
++                    .credential_source = .openai_codex,
++                    .model = openai_codex.default_model,
++                });
++                defer attempt.deinit(alloc);
++                switch (attempt) {
++                    .outcome => {},
++                    .failure => try writeStderr(deps, "fx login openai-codex: signed in, but could not save the default credential and model\n"),
++                }
++                return .handled_success;
++            }
++            if (rest.len == 1 and !std.mem.eql(u8, rest[0], "vercel")) {
++                try writeStderr(deps, "usage: fx login [vercel|openai-codex]\n");
+                 return .handled_failure;
+             }
+             login_flow.runLogin(
+@@ -744,8 +776,34 @@ fn runNonInteractiveWithDeps(
+             return .handled_success;
+         },
+         .logout => |rest| {
+-            if (rest.len != 0) {
+-                try writeStderr(deps, "usage: fx logout\n");
++            if (rest.len > 1) {
++                try writeStderr(deps, "usage: fx logout [vercel|openai-codex]\n");
++                return .handled_failure;
++            }
++            if (rest.len == 1 and
++                (std.mem.eql(u8, rest[0], "openai-codex") or std.mem.eql(u8, rest[0], "codex")))
++            {
++                const deleted = openai_codex.logout() catch {
++                    try writeStderr(deps, "fx logout openai-codex: failed to remove the saved session\n");
++                    return .handled_failure;
++                };
++                var attempt = config_runtime.attemptUserPreferences(alloc, .{
++                    .clear_credential_source = true,
++                    .model = cfg.default_model,
++                });
++                defer attempt.deinit(alloc);
++                switch (attempt) {
++                    .outcome => {},
++                    .failure => try writeStderr(deps, "fx logout openai-codex: could not clear the saved credential and restore the default model\n"),
++                }
++                try writeStdout(
++                    deps,
++                    if (deleted) "Signed out of OpenAI Codex.\n" else "No OpenAI Codex session found.\n",
++                );
++                return .handled_success;
++            }
++            if (rest.len == 1 and !std.mem.eql(u8, rest[0], "vercel")) {
++                try writeStderr(deps, "usage: fx logout [vercel|openai-codex]\n");
+                 return .handled_failure;
+             }
+             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
+diff --git a/src/core/config/model_capabilities.zig b/src/core/config/model_capabilities.zig
+index e1ee2da..7640272 100644
+--- a/src/core/config/model_capabilities.zig
++++ b/src/core/config/model_capabilities.zig
+@@ -83,7 +83,19 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+ 
+ fn localCapabilitiesForModel(model: []const u8) Capabilities {
+     var capabilities: Capabilities = .{};
+-    if (std.mem.startsWith(u8, model, "anthropic/")) {
++    if (std.mem.startsWith(u8, model, "openai-codex/")) {
++        const efforts = [_]types.ReasoningEffort{
++            types.ReasoningEffort.literal("low"),
++            types.ReasoningEffort.literal("medium"),
++            types.ReasoningEffort.literal("high"),
++            types.ReasoningEffort.literal("xhigh"),
++        };
++        capabilities.supports_reasoning = true;
++        capabilities.reasoning_efforts = .fromSlice(&efforts);
++        capabilities.supports_tool_use = true;
++        capabilities.parallel_tool_calls = true;
++        capabilities.max_output_tokens = 128_000;
++    } else if (std.mem.startsWith(u8, model, "anthropic/")) {
+         capabilities.prompt_caching = true;
+     } else if (std.mem.startsWith(u8, model, "xai/")) {
+         capabilities.parallel_tool_calls = true;
+@@ -152,6 +164,7 @@ pub fn reasoningEffortOptionCount(capabilities: Capabilities) usize {
+ }
+ 
+ fn localContextWindowSize(model: []const u8) ?u32 {
++    if (std.mem.startsWith(u8, model, "openai-codex/")) return 272_000;
+     if (std.mem.startsWith(u8, model, "anthropic/")) {
+         const million_context_models = [_][]const u8{
+             "anthropic/claude-fable-5",
+@@ -219,6 +232,16 @@ test "capabilities never infer reasoning or Fast controls from model IDs" {
+     }
+ }
+ 
++test "OpenAI Codex capabilities expose direct transport controls" {
++    const capabilities = capabilitiesForModel("openai-codex/gpt-5.6-sol");
++    try std.testing.expect(capabilities.supports_reasoning);
++    try std.testing.expect(capabilities.supports_tool_use);
++    try std.testing.expectEqual(@as(?bool, true), capabilities.parallel_tool_calls);
++    try std.testing.expectEqual(@as(?u32, 272_000), capabilities.context_window);
++    try std.testing.expectEqual(@as(?u32, 128_000), capabilities.max_output_tokens);
++    try std.testing.expectEqual(@as(usize, 4), capabilities.reasoning_efforts.len);
++}
++
+ test "resolveCapabilities preserves Gateway controls and unrelated local policy" {
+     const efforts = [_]types.ReasoningEffort{
+         types.ReasoningEffort.literal("future-tier"),
+diff --git a/src/core/output/output_contracts.zig b/src/core/output/output_contracts.zig
+index f8bfa73..3615c84 100644
+--- a/src/core/output/output_contracts.zig
++++ b/src/core/output/output_contracts.zig
+@@ -660,9 +660,10 @@ pub const ModelListSnapshot = struct {
+         const reason = self.public_only_reason orelse return "Using the public model catalog.";
+         return switch (reason) {
+             .no_credential => "Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
++            .direct_provider => "OpenAI Codex uses direct subscription transport; showing the public Gateway catalog.",
+             .fx_login_team_required => "Choose a Vercel team to load its private models.",
+             .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
+-            .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
++            .credential_refresh_failed => "Credential refresh failed; using the public model catalog.",
+             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
+         };
+     }
+diff --git a/src/core/shared/types.zig b/src/core/shared/types.zig
+index 1c11096..824c3f7 100644
+--- a/src/core/shared/types.zig
++++ b/src/core/shared/types.zig
+@@ -90,6 +90,7 @@ test "context notice body drops legacy markers from every line" {
+ pub const CredentialSource = enum {
+     vercel_oidc_token,
+     ai_gateway_api_key,
++    openai_codex,
+     fx_login,
+     stored_key,
+ };
+diff --git a/src/gateway/openai_codex.zig b/src/gateway/openai_codex.zig
+new file mode 100644
+index 0000000..3717014
+--- /dev/null
++++ b/src/gateway/openai_codex.zig
+@@ -0,0 +1,589 @@
++const std = @import("std");
++const agent_stream_provider = @import("../core/agent/stream_provider.zig");
++const io_mod = @import("../core/shared/io.zig");
++const types = @import("../core/shared/types.zig");
++const gateway_client = @import("client.zig");
++
++const Allocator = std.mem.Allocator;
++
++pub const model_prefix = "openai-codex/";
++pub const responses_url = "https://chatgpt.com/backend-api/codex/responses";
++const max_error_body_bytes: usize = 64 * 1024;
++const max_sse_line_bytes: usize = 1024 * 1024;
++
++pub fn isModel(model: []const u8) bool {
++    return std.mem.startsWith(u8, model, model_prefix) and model.len > model_prefix.len;
++}
++
++pub fn buildRequest(
++    alloc: Allocator,
++    request: agent_stream_provider.BuildRequest,
++) ![]u8 {
++    if (!isModel(request.model)) return error.InvalidOpenAICodexModel;
++    if (request.verified_images != null or request.vision_mode != .unavailable) {
++        return error.OpenAICodexImagesUnsupported;
++    }
++    if (request.response_format != null) return error.OpenAICodexStructuredResponseUnsupported;
++
++    var instructions: std.ArrayList(u8) = .empty;
++    defer instructions.deinit(alloc);
++    for (request.messages) |message| {
++        if (message.role != .system) continue;
++        const content = message.content orelse continue;
++        if (instructions.items.len > 0) try instructions.appendSlice(alloc, "\n\n");
++        try instructions.appendSlice(alloc, content);
++    }
++
++    var out: std.Io.Writer.Allocating = .init(alloc);
++    errdefer out.deinit();
++    const writer = &out.writer;
++    try writer.writeAll("{\"model\":");
++    try std.json.Stringify.value(request.model[model_prefix.len..], .{}, writer);
++    try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
++    try std.json.Stringify.value(
++        if (instructions.items.len > 0) instructions.items else "You are a helpful assistant.",
++        .{},
++        writer,
++    );
++    try writer.writeAll(",\"input\":[");
++
++    var first_input = true;
++    for (request.messages) |message| {
++        switch (message.role) {
++            .system => continue,
++            .user => try writeMessageItem(writer, &first_input, "user", "input_text", message.content orelse ""),
++            .assistant => {
++                if (message.content) |content| {
++                    if (content.len > 0) {
++                        try writeMessageItem(writer, &first_input, "assistant", "output_text", content);
++                    }
++                }
++                for (message.tool_calls) |call| {
++                    try writeSeparator(writer, &first_input);
++                    try writer.writeAll("{\"type\":\"function_call\",\"call_id\":");
++                    try std.json.Stringify.value(call.id, .{}, writer);
++                    try writer.writeAll(",\"name\":");
++                    try std.json.Stringify.value(call.name, .{}, writer);
++                    try writer.writeAll(",\"arguments\":");
++                    try std.json.Stringify.value(call.arguments_json, .{}, writer);
++                    try writer.writeByte('}');
++                }
++            },
++            .tool => {
++                const call_id = message.tool_call_id orelse return error.OpenAICodexToolCallIdMissing;
++                try writeSeparator(writer, &first_input);
++                try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
++                try std.json.Stringify.value(call_id, .{}, writer);
++                try writer.writeAll(",\"output\":");
++                try std.json.Stringify.value(message.content orelse "", .{}, writer);
++                try writer.writeByte('}');
++            },
++        }
++    }
++    try writer.writeAll("],\"tools\":[");
++    var first_tool = true;
++    try writeSerializedToolArray(alloc, writer, &first_tool, request.serialized_tools);
++    for (request.selected_dynamic_tool_schemas) |schema| {
++        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema, .{});
++        defer parsed.deinit();
++        try writeToolSchema(writer, &first_tool, parsed.value);
++    }
++    try writer.writeAll("],\"tool_choice\":");
++    try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
++    try writer.writeAll(",\"parallel_tool_calls\":true,\"text\":{\"verbosity\":\"low\"},\"include\":[\"reasoning.encrypted_content\"]");
++    if (request.session_id) |session_id| {
++        if (cacheKey(session_id).len > 0) {
++            try writer.writeAll(",\"prompt_cache_key\":");
++            try std.json.Stringify.value(cacheKey(session_id), .{}, writer);
++        }
++    }
++    if (request.provider_options.reasoning) |resolved_effort| {
++        var effort = resolved_effort;
++        try writer.writeAll(",\"reasoning\":{\"effort\":");
++        try std.json.Stringify.value(effort.label(), .{}, writer);
++        try writer.writeAll(",\"summary\":\"auto\"}");
++    }
++    try writer.writeByte('}');
++    return out.toOwnedSlice();
++}
++
++fn writeMessageItem(
++    writer: *std.Io.Writer,
++    first: *bool,
++    role: []const u8,
++    content_type: []const u8,
++    text: []const u8,
++) !void {
++    try writeSeparator(writer, first);
++    try writer.writeAll("{\"type\":\"message\",\"role\":");
++    try std.json.Stringify.value(role, .{}, writer);
++    if (std.mem.eql(u8, role, "assistant")) try writer.writeAll(",\"status\":\"completed\"");
++    try writer.writeAll(",\"content\":[{\"type\":");
++    try std.json.Stringify.value(content_type, .{}, writer);
++    try writer.writeAll(",\"text\":");
++    try std.json.Stringify.value(text, .{}, writer);
++    if (std.mem.eql(u8, content_type, "output_text")) try writer.writeAll(",\"annotations\":[]");
++    try writer.writeAll("}]}");
++}
++
++fn writeSeparator(writer: *std.Io.Writer, first: *bool) !void {
++    if (!first.*) try writer.writeByte(',');
++    first.* = false;
++}
++
++fn writeSerializedToolArray(
++    alloc: Allocator,
++    writer: *std.Io.Writer,
++    first: *bool,
++    serialized_tools: []const u8,
++) !void {
++    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, serialized_tools, .{});
++    defer parsed.deinit();
++    if (parsed.value != .array) return error.InvalidOpenAICodexTools;
++    for (parsed.value.array.items) |tool| try writeToolSchema(writer, first, tool);
++}
++
++fn writeToolSchema(writer: *std.Io.Writer, first: *bool, tool: std.json.Value) !void {
++    if (tool != .object) return error.InvalidOpenAICodexTool;
++    const name = tool.object.get("name") orelse return error.InvalidOpenAICodexTool;
++    const description = tool.object.get("description") orelse return error.InvalidOpenAICodexTool;
++    const parameters = tool.object.get("inputSchema") orelse
++        tool.object.get("parameters") orelse return error.InvalidOpenAICodexTool;
++    if (name != .string or description != .string or parameters != .object) {
++        return error.InvalidOpenAICodexTool;
++    }
++    try writeSeparator(writer, first);
++    try writer.writeAll("{\"type\":\"function\",\"name\":");
++    try std.json.Stringify.value(name.string, .{}, writer);
++    try writer.writeAll(",\"description\":");
++    try std.json.Stringify.value(description.string, .{}, writer);
++    try writer.writeAll(",\"parameters\":");
++    try std.json.Stringify.value(parameters, .{}, writer);
++    try writer.writeAll(",\"strict\":false}");
++}
++
++pub fn stream(
++    alloc: Allocator,
++    request: agent_stream_provider.Request,
++) !agent_stream_provider.Result {
++    if (!isModel(request.model)) return error.InvalidOpenAICodexModel;
++    const account_id = request.team orelse return error.OpenAICodexAccountIdMissing;
++    if (account_id.len == 0) return error.OpenAICodexAccountIdMissing;
++    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
++
++    const uri = try std.Uri.parse(responses_url);
++    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
++    defer alloc.free(auth_header);
++
++    var extra_headers_buf: [7]std.http.Header = undefined;
++    var extra_len: usize = 0;
++    extra_headers_buf[extra_len] = .{ .name = "chatgpt-account-id", .value = account_id };
++    extra_len += 1;
++    extra_headers_buf[extra_len] = .{ .name = "originator", .value = "fx" };
++    extra_len += 1;
++    extra_headers_buf[extra_len] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
++    extra_len += 1;
++    extra_headers_buf[extra_len] = .{ .name = "accept", .value = "text/event-stream" };
++    extra_len += 1;
++    if (request.session_id) |session_id| {
++        const cache_key = cacheKey(session_id);
++        if (cache_key.len > 0) {
++            extra_headers_buf[extra_len] = .{ .name = "session-id", .value = cache_key };
++            extra_len += 1;
++            extra_headers_buf[extra_len] = .{ .name = "x-client-request-id", .value = cache_key };
++            extra_len += 1;
++        }
++    }
++
++    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
++    defer client.deinit();
++    var http_request = try client.request(.POST, uri, .{
++        .headers = .{
++            .content_type = .{ .override = "application/json" },
++            .authorization = .{ .override = auth_header },
++            .accept_encoding = .omit,
++            .user_agent = .{ .override = gateway_client.user_agent },
++        },
++        .extra_headers = extra_headers_buf[0..extra_len],
++        .keep_alive = false,
++        .redirect_behavior = .unhandled,
++    });
++    defer http_request.deinit();
++
++    http_request.transfer_encoding = .{ .content_length = request.payload.len };
++    var send_buffer: [8192]u8 = undefined;
++    request.delivery.markPossiblySent();
++    var body_writer = try http_request.sendBodyUnflushed(&send_buffer);
++    try body_writer.writer.writeAll(request.payload);
++    try body_writer.end();
++    try http_request.connection.?.flush();
++    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
++
++    var response = try http_request.receiveHead(&.{});
++    if (response.head.status != .ok) {
++        var error_buffer: [max_error_body_bytes]u8 = undefined;
++        var error_writer = std.Io.Writer.fixed(&error_buffer);
++        var transfer_buffer: [4096]u8 = undefined;
++        const error_reader = response.reader(&transfer_buffer);
++        _ = error_reader.streamRemaining(&error_writer) catch {};
++        return .{
++            .status = response.head.status,
++            .err_body = try alloc.dupe(u8, error_writer.buffered()),
++            .ownership = .owned,
++        };
++    }
++
++    request.attempt_evidence.provider_admitted = true;
++    var transfer_buffer: [8192]u8 = undefined;
++    const reader = response.reader(&transfer_buffer);
++    const completion = try consumeSseStream(alloc, reader, request);
++    return .{
++        .status = .ok,
++        .completion = completion,
++        .reconcile_generation_usage = false,
++        .ownership = .owned,
++    };
++}
++
++fn cacheKey(session_id: []const u8) []const u8 {
++    return session_id[0..@min(session_id.len, 64)];
++}
++
++const SseReader = struct {
++    pending: std.ArrayList(u8) = .empty,
++
++    fn deinit(self: *SseReader, alloc: Allocator) void {
++        self.pending.deinit(alloc);
++    }
++
++    fn release(self: *SseReader) void {
++        self.pending.clearRetainingCapacity();
++    }
++
++    fn next(self: *SseReader, alloc: Allocator, reader: *std.Io.Reader) !?[]const u8 {
++        while (true) {
++            const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
++                error.StreamTooLong => {
++                    const buffered = reader.buffered();
++                    if (buffered.len == 0) return error.OpenAICodexSseReadStalled;
++                    if (buffered.len > max_sse_line_bytes - self.pending.items.len) {
++                        return error.OpenAICodexSseEventTooLarge;
++                    }
++                    try self.pending.appendSlice(alloc, buffered);
++                    reader.tossBuffered();
++                    continue;
++                },
++                error.ReadFailed => return error.ReadFailed,
++            } orelse {
++                if (self.pending.items.len > 0) return self.pending.items;
++                return null;
++            };
++            if (fragment.len > max_sse_line_bytes - self.pending.items.len) {
++                return error.OpenAICodexSseEventTooLarge;
++            }
++            if (self.pending.items.len == 0) return fragment;
++            try self.pending.appendSlice(alloc, fragment);
++            return self.pending.items;
++        }
++    }
++};
++
++fn consumeSseStream(
++    alloc: Allocator,
++    reader: *std.Io.Reader,
++    request: agent_stream_provider.Request,
++) !types.GatewayCompletion {
++    var content: std.ArrayList(u8) = .empty;
++    defer content.deinit(alloc);
++    var tool_calls: std.ArrayList(types.ToolCall) = .empty;
++    defer tool_calls.deinit(alloc);
++    errdefer for (tool_calls.items) |call| types.freeToolCall(alloc, call);
++    var started_tool_ids: std.ArrayList([]u8) = .empty;
++    defer {
++        for (started_tool_ids.items) |id| alloc.free(id);
++        started_tool_ids.deinit(alloc);
++    }
++    var provider_failure_detail: ?[]u8 = null;
++    errdefer if (provider_failure_detail) |detail| alloc.free(detail);
++    var usage: types.Usage = .{};
++    var finish_reason: ?types.ProviderFinishReason = null;
++    var terminal = false;
++    var sse_reader: SseReader = .{};
++    defer sse_reader.deinit(alloc);
++
++    while (!terminal) {
++        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
++        const raw_line = (try sse_reader.next(alloc, reader)) orelse break;
++        defer sse_reader.release();
++        const line = std.mem.trim(u8, raw_line, "\r");
++        if (line.len == 0 or line[0] == ':') continue;
++        const prefix = "data:";
++        if (!std.mem.startsWith(u8, line, prefix)) continue;
++        const data = std.mem.trimStart(u8, line[prefix.len..], " ");
++        if (std.mem.eql(u8, data, "[DONE]")) break;
++
++        var parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch |err| {
++            if (err == error.OutOfMemory) return err;
++            continue;
++        };
++        defer parsed.deinit();
++        if (parsed.value != .object) continue;
++        const root = parsed.value.object;
++        const event_type_value = root.get("type") orelse continue;
++        if (event_type_value != .string) continue;
++        const event_type = event_type_value.string;
++
++        if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
++            const delta = stringField(root, "delta") orelse continue;
++            request.on_content_chunk(request.callback_ctx, delta);
++            try appendCaptured(alloc, &content, delta, request.content_capture_limit);
++            continue;
++        }
++        if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta")) {
++            const delta = stringField(root, "delta") orelse continue;
++            if (request.on_reasoning_chunk) |callback| callback(request.callback_ctx, delta);
++            continue;
++        }
++        if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
++            const delta = stringField(root, "delta") orelse continue;
++            if (request.on_tool_input_chunk) |callback| callback(request.callback_ctx, delta);
++            continue;
++        }
++        if (std.mem.eql(u8, event_type, "response.output_item.added")) {
++            const item = objectField(root, "item") orelse continue;
++            if (!stringFieldEquals(item, "type", "function_call")) continue;
++            const id = stringField(item, "call_id") orelse continue;
++            const name = stringField(item, "name") orelse continue;
++            try markToolStarted(alloc, &started_tool_ids, request, id, name);
++            continue;
++        }
++        if (std.mem.eql(u8, event_type, "response.output_item.done")) {
++            const item = objectField(root, "item") orelse continue;
++            if (!stringFieldEquals(item, "type", "function_call")) continue;
++            const id = stringField(item, "call_id") orelse continue;
++            const name = stringField(item, "name") orelse continue;
++            const arguments = stringField(item, "arguments") orelse "{}";
++            try markToolStarted(alloc, &started_tool_ids, request, id, name);
++            if (findToolCall(tool_calls.items, id) != null) continue;
++            const owned_id = try alloc.dupe(u8, id);
++            errdefer alloc.free(owned_id);
++            const owned_name = try alloc.dupe(u8, name);
++            errdefer alloc.free(owned_name);
++            const owned_arguments = try alloc.dupe(u8, arguments);
++            errdefer alloc.free(owned_arguments);
++            try tool_calls.append(alloc, .{
++                .id = owned_id,
++                .name = owned_name,
++                .arguments_json = owned_arguments,
++                .argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, arguments),
++            });
++            continue;
++        }
++        if (std.mem.eql(u8, event_type, "response.completed") or
++            std.mem.eql(u8, event_type, "response.done") or
++            std.mem.eql(u8, event_type, "response.incomplete"))
++        {
++            const response = objectField(root, "response") orelse root;
++            if (objectField(response, "usage")) |usage_value| usage = parseUsage(usage_value);
++            const status = stringField(response, "status") orelse "completed";
++            finish_reason = if (std.mem.eql(u8, event_type, "response.incomplete") or
++                std.mem.eql(u8, status, "incomplete"))
++                .length
++            else if (tool_calls.items.len > 0)
++                .tool_calls
++            else
++                .stop;
++            terminal = true;
++            continue;
++        }
++        if (std.mem.eql(u8, event_type, "response.failed") or std.mem.eql(u8, event_type, "error")) {
++            const detail = responseErrorMessage(root) orelse "OpenAI Codex response failed";
++            provider_failure_detail = try alloc.dupe(u8, detail);
++            finish_reason = .provider_error;
++            terminal = true;
++        }
++    }
++
++    if (!terminal) return error.OpenAICodexStreamEndedEarly;
++    const owned_content: ?[]u8 = if (content.items.len > 0) try content.toOwnedSlice(alloc) else null;
++    errdefer if (owned_content) |value| alloc.free(value);
++    const owned_tools = try tool_calls.toOwnedSlice(alloc);
++    return .{
++        .content = owned_content,
++        .tool_calls = owned_tools,
++        .provider_failure_detail = provider_failure_detail,
++        .finish_reason = finish_reason,
++        .usage = usage,
++    };
++}
++
++fn appendCaptured(
++    alloc: Allocator,
++    content: *std.ArrayList(u8),
++    delta: []const u8,
++    limit: ?usize,
++) !void {
++    const remaining = if (limit) |maximum| maximum -| @min(maximum, content.items.len) else delta.len;
++    try content.appendSlice(alloc, delta[0..@min(delta.len, remaining)]);
++}
++
++fn markToolStarted(
++    alloc: Allocator,
++    ids: *std.ArrayList([]u8),
++    request: agent_stream_provider.Request,
++    id: []const u8,
++    name: []const u8,
++) !void {
++    for (ids.items) |existing| if (std.mem.eql(u8, existing, id)) return;
++    const owned_id = try alloc.dupe(u8, id);
++    errdefer alloc.free(owned_id);
++    try ids.append(alloc, owned_id);
++    if (request.on_tool_start) |callback| callback(request.callback_ctx, id, name, null);
++}
++
++fn findToolCall(tool_calls: []const types.ToolCall, id: []const u8) ?usize {
++    for (tool_calls, 0..) |tool_call, index| {
++        if (std.mem.eql(u8, tool_call.id, id)) return index;
++    }
++    return null;
++}
++
++fn objectField(object: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
++    const value = object.get(key) orelse return null;
++    return if (value == .object) value.object else null;
++}
++
++fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
++    const value = object.get(key) orelse return null;
++    return if (value == .string) value.string else null;
++}
++
++fn stringFieldEquals(object: std.json.ObjectMap, key: []const u8, expected: []const u8) bool {
++    const value = stringField(object, key) orelse return false;
++    return std.mem.eql(u8, value, expected);
++}
++
++fn parseUsage(object: std.json.ObjectMap) types.Usage {
++    return .{
++        .input_tokens = nonNegativeInteger(object.get("input_tokens")),
++        .output_tokens = nonNegativeInteger(object.get("output_tokens")),
++    };
++}
++
++fn nonNegativeInteger(value: ?std.json.Value) ?u64 {
++    const actual = value orelse return null;
++    if (actual != .integer or actual.integer < 0) return null;
++    return @intCast(actual.integer);
++}
++
++fn responseErrorMessage(root: std.json.ObjectMap) ?[]const u8 {
++    if (stringField(root, "message")) |message| return message;
++    const error_value = root.get("error");
++    if (error_value) |value| {
++        if (value == .string) return value.string;
++        if (value == .object) if (stringField(value.object, "message")) |message| return message;
++    }
++    const response = objectField(root, "response") orelse return null;
++    const nested_error = objectField(response, "error") orelse return null;
++    return stringField(nested_error, "message");
++}
++
++test "OpenAI Codex request maps messages and tool schemas" {
++    const tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
++    const calls = [_]types.ToolCall{.{
++        .id = "call_1",
++        .name = "read_file",
++        .arguments_json = "{\"path\":\"README.md\"}",
++    }};
++    const messages = [_]types.ChatMessage{
++        .{ .role = .system, .content = "Be concise." },
++        .{ .role = .user, .content = "Read it" },
++        .{ .role = .assistant, .tool_calls = &calls },
++        .{ .role = .tool, .tool_call_id = "call_1", .content = "contents" },
++    };
++    const body = try buildRequest(std.testing.allocator, .{
++        .credential_source = .openai_codex,
++        .session_id = "session-123",
++        .model = "openai-codex/gpt-5.6-sol",
++        .serialized_tools = tools,
++        .messages = &messages,
++        .tool_choice = .auto,
++        .provider_options = .{},
++    });
++    defer std.testing.allocator.free(body);
++    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.6-sol\"") != null);
++    try std.testing.expect(std.mem.find(u8, body, "\"parameters\":") != null);
++    try std.testing.expect(std.mem.find(u8, body, "\"inputSchema\":") == null);
++    try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
++    try std.testing.expect(std.mem.find(u8, body, "\"prompt_cache_key\":\"session-123\"") != null);
++}
++
++test "OpenAI Codex SSE maps text tools and usage" {
++    const Capture = struct {
++        content_bytes: usize = 0,
++        tool_starts: usize = 0,
++        tool_argument_bytes: usize = 0,
++
++        fn content(raw: *anyopaque, chunk: []const u8) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.content_bytes += chunk.len;
++        }
++
++        fn toolStart(
++            raw: *anyopaque,
++            _: []const u8,
++            _: []const u8,
++            _: ?[]const u8,
++        ) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.tool_starts += 1;
++        }
++
++        fn toolArguments(raw: *anyopaque, chunk: []const u8) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.tool_argument_bytes += chunk.len;
++        }
++    };
++    const payload =
++        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" ++
++        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n" ++
++        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\n" ++
++        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{}\"}}\n\n" ++
++        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\n";
++    var reader = std.Io.Reader.fixed(payload);
++    var cancel = std.atomic.Value(bool).init(false);
++    var delivery = agent_stream_provider.DeliveryCertainty.init();
++    var evidence: agent_stream_provider.AttemptEvidence = .{};
++    var capture: Capture = .{};
++    const completion = try consumeSseStream(std.testing.allocator, &reader, .{
++        .api_key = "token",
++        .team = "account",
++        .model = "openai-codex/gpt-5.6-sol",
++        .retry_count = 1,
++        .chat_url = "",
++        .payload = "{}",
++        .trace_ctx = .{},
++        .content_capture_limit = null,
++        .delivery = &delivery,
++        .attempt_evidence = &evidence,
++        .callback_ctx = &capture,
++        .on_content_chunk = Capture.content,
++        .on_tool_start = Capture.toolStart,
++        .on_reasoning_chunk = null,
++        .on_tool_input_chunk = Capture.toolArguments,
++        .cancel_flag = &cancel,
++        .credential_source = .openai_codex,
++    });
++    defer {
++        if (completion.content) |content| std.testing.allocator.free(@constCast(content));
++        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
++    }
++    try std.testing.expectEqualStrings("Hello", completion.content.?);
++    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
++    try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
++    try std.testing.expectEqual(@as(?u64, 5), completion.usage.input_tokens);
++    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
++    try std.testing.expectEqual(@as(usize, 5), capture.content_bytes);
++    try std.testing.expectEqual(@as(usize, 1), capture.tool_starts);
++    try std.testing.expectEqual(@as(usize, 2), capture.tool_argument_bytes);
++}
+diff --git a/src/openai_codex_test.zig b/src/openai_codex_test.zig
+new file mode 100644
+index 0000000..94891f5
+--- /dev/null
++++ b/src/openai_codex_test.zig
+@@ -0,0 +1,5 @@
++test {
++    _ = @import("core/auth/openai_codex.zig");
++    _ = @import("core/auth/credentials.zig");
++    _ = @import("gateway/openai_codex.zig");
++}
+diff --git a/src/ui/footer/model_menu_presentation.zig b/src/ui/footer/model_menu_presentation.zig
+index b7f5d8a..4b95368 100644
+--- a/src/ui/footer/model_menu_presentation.zig
++++ b/src/ui/footer/model_menu_presentation.zig
+@@ -337,9 +337,10 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
+         const reason = state.public_only_reason orelse return "Using the public model catalog.";
+         return switch (reason) {
+             .no_credential => "Using the public model catalog; sign in or use an API key for team-private models.",
++            .direct_provider => "OpenAI Codex uses direct subscription transport; showing the public Gateway catalog.",
+             .fx_login_team_required => "Choose a Vercel team to load its private models.",
+             .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
+-            .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
++            .credential_refresh_failed => "Credential refresh failed; using the public model catalog.",
+             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
+         };
+     }
+-- 
+2.51.1
+

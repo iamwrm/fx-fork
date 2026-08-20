@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/vercel-labs/fx.git
+
+jobs:
+  verify:
+    name: Apply, build, and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check out pinned upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=$(tr -d '\r\n' < patches/fx/BASE)
+          expected_commit=$(tr -d '\r\n' < patches/fx/BASE_COMMIT)
+          git init checkouts/fx
+          git -C checkouts/fx remote add origin "$UPSTREAM_REPO"
+          git -C checkouts/fx fetch --depth 1 origin "$base"
+          git -C checkouts/fx checkout --detach FETCH_HEAD
+          actual_commit=$(git -C checkouts/fx rev-parse HEAD)
+          test "$actual_commit" = "$expected_commit"
+
+      - name: Apply patch stack
+        shell: bash
+        working-directory: checkouts/fx
+        run: |
+          set -euo pipefail
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          git am ../../patches/fx/*.patch
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Check formatting
+        working-directory: checkouts/fx
+        run: zig fmt --check build.zig src
+
+      - name: Compile
+        working-directory: checkouts/fx
+        run: zig build
+
+      - name: Run focused unit tests
+        working-directory: checkouts/fx
+        run: zig build test-openai-codex --summary all
