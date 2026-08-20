@@ -10,7 +10,7 @@ on:
       tag:
         description: Release tag
         required: true
-        default: v0.0.4-codex.1
+        default: v0.0.4-codex.2
 
 permissions:
   contents: read
@@ -144,7 +144,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_tag="${REQUESTED_TAG:-v0.0.4-codex.1}"
+          release_tag="${REQUESTED_TAG:-v0.0.4-codex.2}"
           if ! [[ "$release_tag" =~ ^v0\.0\.4-codex\.[1-9][0-9]*$ ]]; then
             echo "::error::release tag must match v0.0.4-codex.N"
             exit 1
@@ -160,6 +160,8 @@ jobs:
             '- Direct ChatGPT Codex Responses transport' \
             '- Reasoning and function-tool streaming' \
             '- Codex credential isolation from Vercel AI Gateway' \
+            '- Text-only turns no longer fail when Vision is available but unused' \
+            '- Supported openai/ model aliases use the active Codex subscription' \
             '' \
             'Built from the pinned vercel-labs/fx base and the IV-0001 patch in this repository.' \
             'Both archives include LICENSE and THIRD_PARTY_NOTICES.md.' \

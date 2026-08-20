@@ -56,14 +56,16 @@ and sets the model to `openai-codex/gpt-5.6-sol`.
 
 ### Request routing
 
-The direct transport is selected only when both conditions hold:
+The direct transport is selected when both conditions hold:
 
 1. The active credential source is `openai_codex`.
-2. The selected model has the `openai-codex/` prefix.
+2. The selected model has the `openai-codex/` prefix or is a supported
+   `openai/` alias from pi's explicit Codex model list.
 
-All other requests retain the upstream Vercel AI Gateway path. The OpenAI
-access token is therefore never offered to the gateway model catalog or a
-non-Codex model route.
+Compatible aliases such as `openai/gpt-5.6-luna` are encoded as their Codex
+model IDs. Other model IDs are rejected before an HTTP request is made. The
+OpenAI access token is therefore never offered to the gateway model catalog or
+a non-Codex model route.
 
 ### Responses protocol
 
@@ -83,8 +85,10 @@ non-Codex model route.
 
 The patch defines local capabilities for `openai-codex/gpt-5.6-sol`, including
 tools, parallel tool calls, reasoning levels through `xhigh`, and the context
-and output limits used by the provider. The direct model remains usable even
-though it is intentionally absent from Vercel's public model catalog.
+and output limits used by the provider. It also recognizes pi's explicit Codex
+model IDs when they are selected through the `openai/` namespace. Direct models
+remain usable even though they are intentionally absent from Vercel's public
+model catalog.
 
 ### Fork update safeguard
 
@@ -120,6 +124,8 @@ The focused suite covers:
 - device polling intervals and JWT account ID extraction
 - persisted session round trips
 - request schema, tools, and prompt cache fields
+- text-only requests while the optional Vision tool is available
+- compatible `openai/` model aliases and rejection of unsupported aliases
 - streamed text, reasoning, tool calls, completion, and usage
 - local model capabilities
 - isolation from the Vercel model catalog
@@ -145,8 +151,8 @@ binary receives an ad-hoc code signature but is not Apple-notarized.
 - This patch covers the native fx runtime. It does not add a Codex transport to
   fx's WASM or N-API SDK surfaces.
 - The direct path supports fx's text, reasoning, and function-tool workflow.
-  Image input and structured-output extensions remain on existing provider
-  paths.
+  Required image input and structured-output extensions remain on existing
+  provider paths.
 - Device login and token refresh require network access to OpenAI. Unit tests
   exercise deterministic parsing and conversion boundaries without live
   credentials.

@@ -1,0 +1,179 @@
+From 81386a2f2fe7df856a40e1e1f7b1888c74276f9c Mon Sep 17 00:00:00 2001
+From: iamwrm <iamwrm@users.noreply.github.com>
+Date: Thu, 20 Aug 2026 20:29:15 +0900
+Subject: [PATCH] Fix OpenAI Codex text routing and model aliases
+
+---
+ README.md                      |  2 +-
+ src/core/auth/openai_codex.zig | 22 ++++++++++++-
+ src/gateway/openai_codex.zig   | 57 +++++++++++++++++++++++++++++++---
+ 3 files changed, 74 insertions(+), 7 deletions(-)
+
+diff --git a/README.md b/README.md
+index 29574fa..c137109 100644
+--- a/README.md
++++ b/README.md
+@@ -45,7 +45,7 @@ To use an existing ChatGPT subscription through OpenAI Codex, run the device-cod
+ fx login openai-codex
+ ```
+ 
+-This stores a refreshable OpenAI session in the fx profile and selects `openai-codex/gpt-5.6-sol`. Use `fx logout openai-codex` to remove it. Codex subscription requests go directly to the ChatGPT Codex Responses endpoint and are not sent through Vercel AI Gateway.
++This stores a refreshable OpenAI session in the fx profile and selects `openai-codex/gpt-5.6-sol`. Use `fx logout openai-codex` to remove it. While this credential is active, supported `openai/` model aliases such as `openai/gpt-5.6-luna` resolve to the Codex backend. Codex subscription requests go directly to the ChatGPT Codex Responses endpoint and are not sent through Vercel AI Gateway.
+ 
+ This patched build does not use fx's upstream auto-upgrade channel because an official upgrade would remove the Codex subscription transport. Install patched updates from [iamwrm/fx-fork releases](https://github.com/iamwrm/fx-fork/releases).
+ 
+diff --git a/src/core/auth/openai_codex.zig b/src/core/auth/openai_codex.zig
+index 3bae2bf..6a2a489 100644
+--- a/src/core/auth/openai_codex.zig
++++ b/src/core/auth/openai_codex.zig
+@@ -10,7 +10,18 @@ const secret = @import("secret.zig");
+ const Allocator = std.mem.Allocator;
+ 
+ pub const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
+-pub const default_model = "openai-codex/gpt-5.6-sol";
++pub const model_prefix = "openai-codex/";
++pub const openai_model_prefix = "openai/";
++pub const supported_model_ids = [_][]const u8{
++    "gpt-5.3-codex-spark",
++    "gpt-5.4",
++    "gpt-5.4-mini",
++    "gpt-5.5",
++    "gpt-5.6-luna",
++    "gpt-5.6-sol",
++    "gpt-5.6-terra",
++};
++pub const default_model = model_prefix ++ "gpt-5.6-sol";
+ pub const verification_uri = "https://auth.openai.com/codex/device";
+ const user_code_url = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+ const device_token_url = "https://auth.openai.com/api/accounts/deviceauth/token";
+@@ -33,6 +44,15 @@ pub const AuthError = error{
+     AccountIdMissing,
+ };
+ 
++pub fn compatibleOpenAIModelId(model: []const u8) ?[]const u8 {
++    if (!std.mem.startsWith(u8, model, openai_model_prefix)) return null;
++    const model_id = model[openai_model_prefix.len..];
++    for (supported_model_ids) |supported| {
++        if (std.mem.eql(u8, model_id, supported)) return model_id;
++    }
++    return null;
++}
++
+ pub const Access = struct {
+     token: []u8,
+     account_id: []u8,
+diff --git a/src/gateway/openai_codex.zig b/src/gateway/openai_codex.zig
+index 3717014..583e746 100644
+--- a/src/gateway/openai_codex.zig
++++ b/src/gateway/openai_codex.zig
+@@ -1,12 +1,13 @@
+ const std = @import("std");
+ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
++const openai_codex_auth = @import("../core/auth/openai_codex.zig");
+ const io_mod = @import("../core/shared/io.zig");
+ const types = @import("../core/shared/types.zig");
+ const gateway_client = @import("client.zig");
+ 
+ const Allocator = std.mem.Allocator;
+ 
+-pub const model_prefix = "openai-codex/";
++pub const model_prefix = openai_codex_auth.model_prefix;
+ pub const responses_url = "https://chatgpt.com/backend-api/codex/responses";
+ const max_error_body_bytes: usize = 64 * 1024;
+ const max_sse_line_bytes: usize = 1024 * 1024;
+@@ -15,12 +16,17 @@ pub fn isModel(model: []const u8) bool {
+     return std.mem.startsWith(u8, model, model_prefix) and model.len > model_prefix.len;
+ }
+ 
++fn requestModelId(model: []const u8) ?[]const u8 {
++    if (isModel(model)) return model[model_prefix.len..];
++    return openai_codex_auth.compatibleOpenAIModelId(model);
++}
++
+ pub fn buildRequest(
+     alloc: Allocator,
+     request: agent_stream_provider.BuildRequest,
+ ) ![]u8 {
+-    if (!isModel(request.model)) return error.InvalidOpenAICodexModel;
+-    if (request.verified_images != null or request.vision_mode != .unavailable) {
++    const model_id = requestModelId(request.model) orelse return error.InvalidOpenAICodexModel;
++    if (request.verified_images != null or request.vision_mode == .required) {
+         return error.OpenAICodexImagesUnsupported;
+     }
+     if (request.response_format != null) return error.OpenAICodexStructuredResponseUnsupported;
+@@ -38,7 +44,7 @@ pub fn buildRequest(
+     errdefer out.deinit();
+     const writer = &out.writer;
+     try writer.writeAll("{\"model\":");
+-    try std.json.Stringify.value(request.model[model_prefix.len..], .{}, writer);
++    try std.json.Stringify.value(model_id, .{}, writer);
+     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
+     try std.json.Stringify.value(
+         if (instructions.items.len > 0) instructions.items else "You are a helpful assistant.",
+@@ -166,7 +172,7 @@ pub fn stream(
+     alloc: Allocator,
+     request: agent_stream_provider.Request,
+ ) !agent_stream_provider.Result {
+-    if (!isModel(request.model)) return error.InvalidOpenAICodexModel;
++    if (requestModelId(request.model) == null) return error.InvalidOpenAICodexModel;
+     const account_id = request.team orelse return error.OpenAICodexAccountIdMissing;
+     if (account_id.len == 0) return error.OpenAICodexAccountIdMissing;
+     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+@@ -508,6 +514,7 @@ test "OpenAI Codex request maps messages and tool schemas" {
+         .serialized_tools = tools,
+         .messages = &messages,
+         .tool_choice = .auto,
++        .vision_mode = .optional,
+         .provider_options = .{},
+     });
+     defer std.testing.allocator.free(body);
+@@ -518,6 +525,46 @@ test "OpenAI Codex request maps messages and tool schemas" {
+     try std.testing.expect(std.mem.find(u8, body, "\"prompt_cache_key\":\"session-123\"") != null);
+ }
+ 
++test "OpenAI Codex request maps supported OpenAI namespace aliases" {
++    const messages = [_]types.ChatMessage{
++        .{ .role = .user, .content = "Hello" },
++    };
++    const body = try buildRequest(std.testing.allocator, .{
++        .credential_source = .openai_codex,
++        .model = "openai/gpt-5.6-luna",
++        .serialized_tools = "[]",
++        .messages = &messages,
++        .tool_choice = .auto,
++        .provider_options = .{},
++    });
++    defer std.testing.allocator.free(body);
++
++    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.6-luna\"") != null);
++    try std.testing.expectError(error.InvalidOpenAICodexModel, buildRequest(std.testing.allocator, .{
++        .credential_source = .openai_codex,
++        .model = "openai/gpt-4o",
++        .serialized_tools = "[]",
++        .messages = &messages,
++        .tool_choice = .auto,
++        .provider_options = .{},
++    }));
++}
++
++test "OpenAI Codex request rejects required image handling" {
++    const messages = [_]types.ChatMessage{
++        .{ .role = .user, .content = "Inspect the attached image" },
++    };
++    try std.testing.expectError(error.OpenAICodexImagesUnsupported, buildRequest(std.testing.allocator, .{
++        .credential_source = .openai_codex,
++        .model = "openai-codex/gpt-5.6-sol",
++        .serialized_tools = "[]",
++        .messages = &messages,
++        .tool_choice = .auto,
++        .vision_mode = .required,
++        .provider_options = .{},
++    }));
++}
++
+ test "OpenAI Codex SSE maps text tools and usage" {
+     const Capture = struct {
+         content_bytes: usize = 0,
+-- 
+2.51.1
+
