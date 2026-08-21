@@ -63,4 +63,6 @@ jobs:
 
       - name: Run focused unit tests
         working-directory: checkouts/fx
-        run: zig build test-openai-codex --summary all
+        run: |
+          zig build test-openai-codex --summary all
+          zig build test-opencode --summary all

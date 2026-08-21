@@ -1,0 +1,1582 @@
+From 2654386d2165ad733f7939f34658760989834bb1 Mon Sep 17 00:00:00 2001
+From: fx-fork <fx-fork@users.noreply.github.com>
+Date: Fri, 21 Aug 2026 14:15:08 +0800
+Subject: [PATCH] IV-0002 Add OpenCode Zen and OpenCode Go providers
+
+Route opencode/<model> to https://opencode.ai/zen/v1 and
+opencode-go/<model> to https://opencode.ai/zen/go/v1 over an
+OpenAI Chat Completions transport with streamed tool calls,
+reasoning deltas, usage, and keep-alive tolerant SSE parsing.
+
+One credential source covers both fleets: OPENCODE_API_KEY or a
+stored key in ~/.fx/opencode-auth.json saved by 'fx login
+opencode|opencode-go'. Model namespaces disambiguate identical
+model ids across OpenCode, the Codex subscription, and the AI
+Gateway; mismatched model/credential pairs fail with actionable
+errors, and selecting an OpenCode model adopts its credential
+when it resolves.
+
+Capabilities advertise tool use with conservative family context
+windows. Focused tests run via 'zig build test-opencode'.
+---
+ build.zig                              |  17 +
+ src/builtins/commands.zig              |   8 +-
+ src/builtins/gateway.zig               |  77 +++
+ src/core/auth/credentials.zig          |  18 +
+ src/core/auth/opencode.zig             | 262 +++++++++
+ src/core/cli/cli_surface.zig           | 107 +++-
+ src/core/config/model_capabilities.zig |  32 +
+ src/core/session/session_commands.zig  |  19 +
+ src/core/shared/types.zig              |   1 +
+ src/gateway/opencode.zig               | 769 +++++++++++++++++++++++++
+ src/opencode_test.zig                  |   5 +
+ 11 files changed, 1307 insertions(+), 8 deletions(-)
+ create mode 100644 src/core/auth/opencode.zig
+ create mode 100644 src/gateway/opencode.zig
+ create mode 100644 src/opencode_test.zig
+
+diff --git a/build.zig b/build.zig
+index 0ee02ff..6c8554c 100644
+--- a/build.zig
++++ b/build.zig
+@@ -107,6 +107,23 @@ pub fn build(b: *std.Build) void {
+     );
+     openai_codex_test_step.dependOn(&run_openai_codex_tests.step);
+ 
++    const opencode_tests = b.addTest(.{
++        .root_module = b.createModule(.{
++            .root_source_file = b.path("src/opencode_test.zig"),
++            .target = target,
++            .optimize = optimize,
++            .link_libc = true,
++        }),
++        .filters = &.{"OpenCode"},
++    });
++    opencode_tests.root_module.addImport("build_options", build_options.createModule());
++    const run_opencode_tests = b.addRunArtifact(opencode_tests);
++    const opencode_test_step = b.step(
++        "test-opencode",
++        "Run focused OpenCode authentication and protocol tests",
++    );
++    opencode_test_step.dependOn(&run_opencode_tests.step);
++
+     if (wasm_surface != .none) {
+         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
+     }
+diff --git a/src/builtins/commands.zig b/src/builtins/commands.zig
+index 4cbfa2b..5e5b227 100644
+--- a/src/builtins/commands.zig
++++ b/src/builtins/commands.zig
+@@ -89,14 +89,14 @@ pub const top_level_specs = [_]TopLevelSpec{
+     .{
+         .kind = .login,
+         .token = "login",
+-        .usage = "login [vercel|openai-codex]",
+-        .summary = "Sign in with Vercel or OpenAI Codex",
++        .usage = "login [vercel|openai-codex|opencode|opencode-go]",
++        .summary = "Sign in with Vercel, OpenAI Codex, or OpenCode",
+     },
+     .{
+         .kind = .logout,
+         .token = "logout",
+-        .usage = "logout [vercel|openai-codex]",
+-        .summary = "Sign out of a saved OAuth session",
++        .usage = "logout [vercel|openai-codex|opencode|opencode-go]",
++        .summary = "Sign out of a saved session or remove a stored API key",
+     },
+     .{
+         .kind = .setup,
+diff --git a/src/builtins/gateway.zig b/src/builtins/gateway.zig
+index 361a224..8022316 100644
+--- a/src/builtins/gateway.zig
++++ b/src/builtins/gateway.zig
+@@ -27,6 +27,7 @@ const web_search_policy = @import("../core/tooling/web_search_policy.zig");
+ const web_search_provider = @import("../core/tooling/web_search_provider.zig");
+ const gateway_schema = @import("../core/tooling/gateway_schema.zig");
+ const openai_codex_gateway = @import("../gateway/openai_codex.zig");
++const opencode_gateway = @import("../gateway/opencode.zig");
+ const tool_advertisement = @import("../core/tooling/tool_advertisement.zig");
+ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
+ const sort_utils = @import("../core/shared/sort_utils.zig");
+@@ -145,6 +146,13 @@ pub fn buildAgentRequest(
+     alloc: Allocator,
+     request: agent_stream_provider_contract.BuildRequest,
+ ) anyerror![]u8 {
++    if (opencode_gateway.isModel(request.model)) {
++        if (request.credential_source != .opencode) return error.OpenCodeCredentialRequired;
++        return opencode_gateway.buildRequest(alloc, request);
++    }
++    if (request.credential_source == .opencode) {
++        return error.OpenCodeModelRequired;
++    }
+     if (request.credential_source == .openai_codex) {
+         return openai_codex_gateway.buildRequest(alloc, request);
+     }
+@@ -432,6 +440,19 @@ fn streamAgentCompletion(
+     alloc: Allocator,
+     request: agent_stream_provider_contract.Request,
+ ) anyerror!agent_stream_provider_contract.Result {
++    if (opencode_gateway.isModel(request.model)) {
++        if (request.credential_source != .opencode) return error.OpenCodeCredentialRequired;
++        return opencode_gateway.stream(alloc, request) catch |err| {
++            request.attempt_evidence.network_failure = .{
++                .cause = .transport_interrupted,
++                .delivery = request.delivery.load(),
++            };
++            return err;
++        };
++    }
++    if (request.credential_source == .opencode) {
++        return error.OpenCodeModelRequired;
++    }
+     if (request.credential_source == .openai_codex) {
+         return openai_codex_gateway.stream(alloc, request) catch |err| {
+             request.attempt_evidence.network_failure = .{
+@@ -2789,3 +2810,59 @@ test "gateway catalog controls are explicit ordered and bounded" {
+     try std.testing.expectEqual(@as(usize, 0), catalog.items[2].reasoning_efforts.items.len);
+     try std.testing.expect(!catalog.items[2].supports_fast_mode);
+ }
++
++test "OpenCode models route by namespace and demand the matching credential" {
++    const messages = [_]shared_types.ChatMessage{
++        .{ .role = .user, .content = "Hello" },
++    };
++    const base = agent_stream_provider_contract.BuildRequest{
++        .model = "opencode/kimi-k3",
++        .serialized_tools = "[]",
++        .messages = &messages,
++        .tool_choice = .auto,
++        .provider_options = .{},
++    };
++
++    // No credential, a gateway credential, or a Codex credential: all refuse
++    // an OpenCode model instead of silently misrouting it.
++    for ([_]?credentials.Source{ null, .ai_gateway_api_key, .openai_codex }) |source| {
++        var request = base;
++        request.credential_source = source;
++        try std.testing.expectError(
++            error.OpenCodeCredentialRequired,
++            agent_stream_provider.build(std.testing.allocator, request),
++        );
++    }
++
++    // The OpenCode credential with a gateway model is refused symmetrically.
++    try std.testing.expectError(error.OpenCodeModelRequired, agent_stream_provider.build(std.testing.allocator, .{
++        .credential_source = .opencode,
++        .model = "zai/glm-5.2",
++        .serialized_tools = "[]",
++        .messages = &messages,
++        .tool_choice = .auto,
++        .provider_options = .{},
++    }));
++
++    // The matching pair builds an OpenAI chat completions payload.
++    const body = try agent_stream_provider.build(std.testing.allocator, .{
++        .credential_source = .opencode,
++        .model = "opencode-go/kimi-k3",
++        .serialized_tools = "[]",
++        .messages = &messages,
++        .tool_choice = .auto,
++        .provider_options = .{},
++    });
++    defer std.testing.allocator.free(body);
++    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"kimi-k3\"") != null);
++}
++
++test "OpenCode namespaces stay distinct from gateway and Codex namespaces" {
++    // opencode/ vs openai-codex/ vs openai/ must never collide on prefix.
++    try std.testing.expect(opencode_gateway.isModel("opencode/kimi-k3"));
++    try std.testing.expect(opencode_gateway.isModel("opencode-go/kimi-k3"));
++    try std.testing.expect(!opencode_gateway.isModel("openai/gpt-5.6-luna"));
++    try std.testing.expect(!opencode_gateway.isModel("openai-codex/gpt-5.6-sol"));
++    try std.testing.expect(!openai_codex_gateway.isModel("opencode/kimi-k3"));
++    try std.testing.expect(openai_codex_gateway.isModel("openai-codex/gpt-5.6-sol"));
++}
+diff --git a/src/core/auth/credentials.zig b/src/core/auth/credentials.zig
+index 25a5fa5..42ad095 100644
+--- a/src/core/auth/credentials.zig
++++ b/src/core/auth/credentials.zig
+@@ -5,6 +5,7 @@ const host = @import("../hosts/host.zig");
+ const io_mod = @import("../shared/io.zig");
+ const oauth = @import("oauth.zig");
+ const openai_codex = @import("openai_codex.zig");
++const opencode = @import("opencode.zig");
+ const oauth_session = @import("oauth_session.zig");
+ const oauth_transport = @import("oauth_transport.zig");
+ const secret = @import("secret.zig");
+@@ -138,6 +139,9 @@ pub fn catalogAccessForCredential(
+     if (selected_source == .openai_codex) {
+         return .{ .public_only = .{ .direct_provider = .openai_codex } };
+     }
++    if (selected_source == .opencode) {
++        return .{ .public_only = .{ .direct_provider = .opencode } };
++    }
+     const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
+         .vercel_oidc_token => .vercel_oidc_token,
+         .ai_gateway_api_key => .ai_gateway_api_key,
+@@ -150,6 +154,7 @@ pub fn catalogAccessForCredential(
+             break :blk .fx_login;
+         },
+         .openai_codex => unreachable,
++        .opencode => unreachable,
+     };
+     return .{
+         .authenticated = .{
+@@ -259,6 +264,8 @@ pub fn resolvePreferring(
+     };
+     if (openai_login) |credential| return .{ .credential = credential };
+ 
++    if (try loadSource(alloc, transport, secret_store, .opencode)) |credential| return .{ .credential = credential };
++
+     if (secret_store.isDisabled()) return .{};
+ 
+     var status: StoredKeyReadStatus = .not_found;
+@@ -291,6 +298,7 @@ fn loadPreferredSource(
+             .stored => loadStoredOpenAICodexCredential(alloc),
+             .refresh_if_needed => loadOpenAICodexCredential(alloc, transport),
+         },
++        .opencode => loadOpenCodeCredential(alloc),
+         else => loadSource(alloc, transport, secret_store, source),
+     };
+ }
+@@ -305,6 +313,7 @@ pub fn loadSource(
+         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
+         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
+         .openai_codex => loadOpenAICodexCredential(alloc, transport),
++        .opencode => loadOpenCodeCredential(alloc),
+         .fx_login => loadFxLoginCredential(alloc, transport),
+         .stored_key => loadStoredKeyCredential(alloc, secret_store),
+     };
+@@ -319,6 +328,7 @@ pub fn sourceExists(
+         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
+         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+         .openai_codex => openai_codex.exists(alloc),
++        .opencode => opencode.exists(alloc),
+         .fx_login => blk: {
+             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
+                 error.OutOfMemory => return err,
+@@ -531,6 +541,7 @@ pub fn sourceLabel(source: Source) []const u8 {
+         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
+         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
+         .openai_codex => "OpenAI Codex subscription",
++        .opencode => "OpenCode API key",
+         .fx_login => "fx login",
+         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+     };
+@@ -907,3 +918,10 @@ test "credential resolution preserves unreadable store classification" {
+     try std.testing.expect(resolution.credential == null);
+     try std.testing.expectEqual(StoredKeyReadStatus.unavailable, resolution.stored_key_status);
+ }
++
++/// Loads the OpenCode API key (environment first, then the stored key file).
++/// The key is static, so both load modes behave identically.
++pub fn loadOpenCodeCredential(alloc: std.mem.Allocator) !?Credential {
++    const api_key = (try opencode.loadApiKey(alloc)) orelse return null;
++    return .{ .token = api_key, .source = .opencode };
++}
+diff --git a/src/core/auth/opencode.zig b/src/core/auth/opencode.zig
+new file mode 100644
+index 0000000..0403f4a
+--- /dev/null
++++ b/src/core/auth/opencode.zig
+@@ -0,0 +1,262 @@
++const std = @import("std");
++const debug_trace = @import("../shared/debug_trace.zig");
++const host_target = @import("../hosts/target.zig");
++const io_mod = @import("../shared/io.zig");
++const profile_paths = @import("../shared/profile_paths.zig");
++const secret = @import("secret.zig");
++const types = @import("../shared/types.zig");
++
++const Allocator = std.mem.Allocator;
++
++/// Model namespaces served by the OpenCode gateways. Both fleets accept the
++/// same OpenCode API key, so one credential source covers both prefixes.
++pub const model_prefix = "opencode/";
++pub const go_model_prefix = "opencode-go/";
++pub const env_var_name = "OPENCODE_API_KEY";
++pub const credential_source: types.CredentialSource = .opencode;
++
++/// OpenAI-compatible chat endpoints behind opencode.ai. `api.opencode.ai` is
++/// a different service and must not be used for model traffic.
++pub const zen_chat_url = "https://opencode.ai/zen/v1/chat/completions";
++pub const go_chat_url = "https://opencode.ai/zen/go/v1/chat/completions";
++
++const auth_file_name = "opencode-auth.json";
++const lock_file_name = "opencode-auth.lock";
++const max_auth_file_bytes: usize = 64 * 1024;
++const mutation_lock_deadline_ms: u64 = 2000;
++const max_api_key_input_bytes: usize = 512;
++
++pub const AuthError = error{
++    InvalidApiKey,
++    InvalidResponse,
++    HomeNotSet,
++};
++
++pub fn isModel(model: []const u8) bool {
++    return isZenModel(model) or isGoModel(model);
++}
++
++pub fn isZenModel(model: []const u8) bool {
++    return std.mem.startsWith(u8, model, model_prefix) and model.len > model_prefix.len;
++}
++
++pub fn isGoModel(model: []const u8) bool {
++    return std.mem.startsWith(u8, model, go_model_prefix) and model.len > go_model_prefix.len;
++}
++
++/// Strips the provider namespace from a model id. The bare id is what the
++/// OpenCode gateway expects on the wire.
++pub fn requestModelId(model: []const u8) ?[]const u8 {
++    if (isZenModel(model)) return model[model_prefix.len..];
++    if (isGoModel(model)) return model[go_model_prefix.len..];
++    return null;
++}
++
++/// Chat completions endpoint for a namespaced model id.
++pub fn chatUrlForModel(model: []const u8) ?[]const u8 {
++    if (isZenModel(model)) return zen_chat_url;
++    if (isGoModel(model)) return go_chat_url;
++    return null;
++}
++
++/// Resolves the OpenCode API key: environment first, then the stored key file.
++/// Returned bytes are owned by the caller and must be released with
++/// `secret.zeroAndFree`.
++pub fn loadApiKey(alloc: Allocator) !?[]u8 {
++    if (io_mod.getenv(env_var_name)) |value| {
++        if (value.len > 0) return try alloc.dupe(u8, value);
++    }
++    if (comptime host_target.is_wasm) return null;
++    return loadStoredApiKey(alloc);
++}
++
++pub fn exists(alloc: Allocator) !bool {
++    if (nonEmptyEnvValue(env_var_name)) return true;
++    if (comptime host_target.is_wasm) return false;
++    const stored = (try loadStoredApiKey(alloc)) orelse return false;
++    defer secret.zeroAndFree(alloc, stored);
++    return true;
++}
++
++/// Persists the API key under `~/.fx/opencode-auth.json` with private
++/// permissions, mirroring the OpenAI Codex session storage guarantees.
++pub fn saveApiKey(alloc: Allocator, api_key: []const u8) !void {
++    if (api_key.len == 0) return AuthError.InvalidApiKey;
++    var mutation = try beginMutation();
++    defer mutation.deinit();
++    const text = try stringify(alloc, api_key);
++    defer secret.zeroAndFree(alloc, text);
++    try io_mod.durableReplaceVerified(alloc, &mutation.fx_dir, auth_file_name, text);
++}
++
++/// Loads only the stored key file (no environment fallback).
++pub fn loadStoredApiKey(alloc: Allocator) !?[]u8 {
++    const home = io_mod.getenv("HOME") orelse return null;
++    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch return null;
++    defer home_dir.close(io_mod.getIo());
++    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
++        .iterate = true,
++        .follow_symlinks = false,
++    }) catch return null;
++    defer fx_dir.close(io_mod.getIo());
++
++    var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
++        .mode = .read_only,
++        .allow_directory = false,
++        .follow_symlinks = false,
++        .resolve_beneath = true,
++    }) catch |err| switch (err) {
++        error.FileNotFound => return null,
++        else => return err,
++    };
++    defer file.close(io_mod.getIo());
++    const stat = try file.stat(io_mod.getIo());
++    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
++        return error.InsecureAuthFile;
++    }
++    const bytes = try io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes);
++    defer secret.zeroAndFree(alloc, bytes);
++    return parseApiKey(alloc, bytes) catch |err| {
++        if (err == error.OutOfMemory) return err;
++        debug_trace.logf("auth", "OpenCode auth parse failed err={s}", .{@errorName(err)});
++        return null;
++    };
++}
++
++/// Removes the stored key file. Returns whether anything was deleted.
++pub fn deleteApiKey() !bool {
++    if (comptime host_target.is_wasm) return false;
++    var mutation = (try beginExistingMutation()) orelse return false;
++    defer mutation.deinit();
++    mutation.fx_dir.dir.deleteFile(io_mod.getIo(), auth_file_name) catch |err| switch (err) {
++        error.FileNotFound => return false,
++        else => return err,
++    };
++    io_mod.syncVerifiedDir(mutation.fx_dir.dir) catch |err| switch (err) {
++        error.OperationUnsupported => {},
++        else => return err,
++    };
++    return true;
++}
++
++fn nonEmptyEnvValue(name: []const u8) bool {
++    const value = io_mod.getenv(name) orelse return false;
++    return value.len > 0;
++}
++
++const Mutation = struct {
++    fx_dir: io_mod.VerifiedDir,
++    lock: io_mod.TimedAdvisoryLock,
++
++    fn deinit(self: *Mutation) void {
++        self.lock.release();
++        self.fx_dir.close();
++        self.* = undefined;
++    }
++};
++
++fn beginMutation() !Mutation {
++    const home = io_mod.getenv("HOME") orelse return AuthError.HomeNotSet;
++    var home_dir = io_mod.VerifiedDir{
++        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
++    };
++    defer home_dir.close();
++    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
++    errdefer fx_dir.close();
++    const lock = try io_mod.acquireTimedAdvisoryLock(&fx_dir, lock_file_name, mutation_lock_deadline_ms);
++    return .{ .fx_dir = fx_dir, .lock = lock };
++}
++
++fn beginExistingMutation() !?Mutation {
++    if (comptime host_target.is_wasm) return null;
++    const home = io_mod.getenv("HOME") orelse return null;
++    var home_dir = io_mod.VerifiedDir{
++        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
++    };
++    defer home_dir.close();
++    var fx_dir = home_dir.dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
++        .iterate = true,
++        .follow_symlinks = false,
++    }) catch |err| switch (err) {
++        error.FileNotFound => return null,
++        else => return err,
++    };
++    errdefer fx_dir.close(io_mod.getIo());
++    const stat = try fx_dir.stat(io_mod.getIo());
++    if (stat.kind != .directory) return error.DurablePathUnsafe;
++    try fx_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
++    var verified = io_mod.VerifiedDir{ .dir = fx_dir };
++    errdefer verified.close();
++    const lock = try io_mod.acquireTimedAdvisoryLock(&verified, lock_file_name, mutation_lock_deadline_ms);
++    return .{ .fx_dir = verified, .lock = lock };
++}
++
++fn parseApiKey(alloc: Allocator, bytes: []const u8) ![]u8 {
++    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
++    defer parsed.deinit();
++    if (parsed.value != .object) return AuthError.InvalidResponse;
++    const object = parsed.value.object;
++    const version = object.get("version") orelse return AuthError.InvalidResponse;
++    if (version != .integer or version.integer != 1) return AuthError.InvalidResponse;
++    const api_key_value = object.get("api_key") orelse return AuthError.InvalidResponse;
++    if (api_key_value != .string or api_key_value.string.len == 0) return AuthError.InvalidResponse;
++    return alloc.dupe(u8, api_key_value.string);
++}
++
++fn stringify(alloc: Allocator, api_key: []const u8) ![]u8 {
++    var out: std.Io.Writer.Allocating = .init(alloc);
++    errdefer out.deinit();
++    try out.writer.writeAll("{\"version\":1,\"api_key\":");
++    try std.json.Stringify.value(api_key, .{}, &out.writer);
++    try out.writer.writeAll("}\n");
++    return out.toOwnedSlice();
++}
++
++test "OpenCode model namespaces route to distinct gateways" {
++    try std.testing.expectEqualStrings("kimi-k2.7-code", requestModelId("opencode/kimi-k2.7-code").?);
++    try std.testing.expectEqualStrings("kimi-k2.7-code", requestModelId("opencode-go/kimi-k2.7-code").?);
++    try std.testing.expectEqualStrings(
++        "https://opencode.ai/zen/v1/chat/completions",
++        chatUrlForModel("opencode/kimi-k3").?,
++    );
++    try std.testing.expectEqualStrings(
++        "https://opencode.ai/zen/go/v1/chat/completions",
++        chatUrlForModel("opencode-go/kimi-k3").?,
++    );
++    try std.testing.expect(chatUrlForModel("openai-codex/gpt-5.6-sol") == null);
++    try std.testing.expect(chatUrlForModel("openai/gpt-5.6-luna") == null);
++    try std.testing.expect(chatUrlForModel("zai/glm-5.2") == null);
++    try std.testing.expect(requestModelId("opencode/") == null);
++    try std.testing.expect(requestModelId("opencode-go/") == null);
++    try std.testing.expect(isModel("opencode-go/deepseek-v4-flash"));
++    try std.testing.expect(!isModel("opencode"));
++    try std.testing.expect(!isModel("opencode-go"));
++}
++
++/// Reads one line from stdin and trims surrounding whitespace. Returns null
++/// for an empty line so callers can treat it as "nothing provided".
++pub fn readApiKeyFromStdin(alloc: Allocator) !?[]u8 {
++    if (comptime host_target.is_wasm) return error.OpenCodeUnavailable;
++    var line: std.ArrayList(u8) = .empty;
++    errdefer line.deinit(alloc);
++    const stdin = std.Io.File.stdin();
++    var chunk: [1]u8 = undefined;
++    while (true) {
++        const read = try stdin.readStreaming(io_mod.getIo(), &.{chunk[0..]});
++        if (read == 0) break;
++        const byte = chunk[0];
++        if (byte == '\n') break;
++        if (line.items.len >= max_api_key_input_bytes) return AuthError.InvalidApiKey;
++        try line.append(alloc, byte);
++    }
++    const trimmed = std.mem.trim(u8, line.items, " \t\r");
++    if (trimmed.len == 0) {
++        line.deinit(alloc);
++        return null;
++    }
++    if (trimmed.ptr != line.items.ptr) {
++        std.mem.copyForwards(u8, line.items, trimmed);
++        line.shrinkRetainingCapacity(trimmed.len);
++    }
++    return try line.toOwnedSlice(alloc);
++}
+diff --git a/src/core/cli/cli_surface.zig b/src/core/cli/cli_surface.zig
+index 969b09d..08106a5 100644
+--- a/src/core/cli/cli_surface.zig
++++ b/src/core/cli/cli_surface.zig
+@@ -23,6 +23,7 @@ const github_workflows = @import("../github/github_workflows.zig");
+ const host = @import("../hosts/host.zig");
+ const login_flow = @import("../auth/login_flow.zig");
+ const openai_codex = @import("../auth/openai_codex.zig");
++const opencode_auth = @import("../auth/opencode.zig");
+ const oauth_transport = @import("../auth/oauth_transport.zig");
+ const secret = @import("../auth/secret.zig");
+ const output_contracts = @import("../output/output_contracts.zig");
+@@ -725,8 +726,15 @@ fn runNonInteractiveWithDeps(
+         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
+         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
+         .login => |rest| {
++            if (rest.len >= 1 and isOpenCodeProviderArg(rest[0])) {
++                if (rest.len > 2) {
++                    try writeStderr(deps, "usage: fx login [vercel|openai-codex|opencode|opencode-go] [api-key]\n");
++                    return .handled_failure;
++                }
++                return runOpenCodeLogin(alloc, deps, rest[0], if (rest.len == 2) rest[1] else null);
++            }
+             if (rest.len > 1) {
+-                try writeStderr(deps, "usage: fx login [vercel|openai-codex]\n");
++                try writeStderr(deps, "usage: fx login [vercel|openai-codex|opencode|opencode-go]\n");
+                 return .handled_failure;
+             }
+             if (rest.len == 1 and
+@@ -757,7 +765,7 @@ fn runNonInteractiveWithDeps(
+                 return .handled_success;
+             }
+             if (rest.len == 1 and !std.mem.eql(u8, rest[0], "vercel")) {
+-                try writeStderr(deps, "usage: fx login [vercel|openai-codex]\n");
++                try writeStderr(deps, "usage: fx login [vercel|openai-codex|opencode|opencode-go]\n");
+                 return .handled_failure;
+             }
+             login_flow.runLogin(
+@@ -778,9 +786,29 @@ fn runNonInteractiveWithDeps(
+         },
+         .logout => |rest| {
+             if (rest.len > 1) {
+-                try writeStderr(deps, "usage: fx logout [vercel|openai-codex]\n");
++                try writeStderr(deps, "usage: fx logout [vercel|openai-codex|opencode|opencode-go]\n");
+                 return .handled_failure;
+             }
++            if (rest.len == 1 and isOpenCodeProviderArg(rest[0])) {
++                const deleted = opencode_auth.deleteApiKey() catch {
++                    try writeStderr(deps, "fx logout opencode: failed to remove the saved API key\n");
++                    return .handled_failure;
++                };
++                var attempt = config_runtime.attemptUserPreferences(alloc, .{
++                    .clear_credential_source = true,
++                    .model = cfg.default_model,
++                });
++                defer attempt.deinit(alloc);
++                switch (attempt) {
++                    .outcome => {},
++                    .failure => try writeStderr(deps, "fx logout opencode: could not clear the saved credential and restore the default model\n"),
++                }
++                try writeStdout(
++                    deps,
++                    if (deleted) "Signed out of OpenCode.\n" else "No OpenCode API key found.\n",
++                );
++                return .handled_success;
++            }
+             if (rest.len == 1 and
+                 (std.mem.eql(u8, rest[0], "openai-codex") or std.mem.eql(u8, rest[0], "codex")))
+             {
+@@ -804,7 +832,7 @@ fn runNonInteractiveWithDeps(
+                 return .handled_success;
+             }
+             if (rest.len == 1 and !std.mem.eql(u8, rest[0], "vercel")) {
+-                try writeStderr(deps, "usage: fx logout [vercel|openai-codex]\n");
++                try writeStderr(deps, "usage: fx logout [vercel|openai-codex|opencode|opencode-go]\n");
+                 return .handled_failure;
+             }
+             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
+@@ -1542,6 +1570,77 @@ fn runGithubWorkflow(
+     return .handled_success;
+ }
+ 
++fn isOpenCodeProviderArg(arg: []const u8) bool {
++    return std.mem.eql(u8, arg, "opencode") or
++        std.mem.eql(u8, arg, "zen") or
++        std.mem.eql(u8, arg, "opencode-go") or
++        std.mem.eql(u8, arg, "go");
++}
++
++fn runOpenCodeLogin(
++    alloc: Allocator,
++    deps: RunDeps,
++    provider_arg: []const u8,
++    key_arg: ?[]const u8,
++) !RunResult {
++    const go_fleet = std.mem.eql(u8, provider_arg, "opencode-go") or
++        std.mem.eql(u8, provider_arg, "go");
++    const label = if (go_fleet) "fx login opencode-go" else "fx login opencode";
++
++    const api_key: []u8 = if (key_arg) |value|
++        try alloc.dupe(u8, value)
++    else blk: {
++        try writeStdout(deps, "OpenCode API key: ");
++        break :blk opencode_auth.readApiKeyFromStdin(alloc) catch |err| switch (err) {
++            error.OutOfMemory => return err,
++            else => {
++                try writeLabeledStderr(alloc, deps, label, "could not read the API key from stdin");
++                return .handled_failure;
++            },
++        } orelse {
++            try writeLabeledStderr(alloc, deps, label, "no API key provided");
++            return .handled_failure;
++        };
++    };
++    defer secret.zeroAndFree(alloc, api_key);
++
++    opencode_auth.saveApiKey(alloc, api_key) catch {
++        try writeLabeledStderr(alloc, deps, label, "failed to save the API key");
++        return .handled_failure;
++    };
++
++    var attempt = config_runtime.attemptUserPreferences(alloc, .{
++        .credential_source = .opencode,
++        .model = if (go_fleet)
++            opencode_auth.go_model_prefix ++ "kimi-k2.7-code"
++        else
++            opencode_auth.model_prefix ++ "kimi-k2.7-code",
++    });
++    defer attempt.deinit(alloc);
++    switch (attempt) {
++        .outcome => {},
++        .failure => try writeLabeledStderr(
++            alloc,
++            deps,
++            label,
++            "signed in, but could not save the default credential and model",
++        ),
++    }
++    try writeStdout(deps, "Signed in to OpenCode.\n");
++    return .handled_success;
++}
++
++fn writeLabeledStderr(
++    alloc: Allocator,
++    deps: RunDeps,
++    label: []const u8,
++    message: []const u8,
++) !void {
++    const text = try std.fmt.allocPrint(alloc, "{s}: {s}\n", .{ label, message });
++    defer alloc.free(text);
++    try writeStderr(deps, text);
++}
++
+ fn writeStdout(deps: RunDeps, text: []const u8) !void {
+     try deps.write_stdout(deps.stdout_ctx, text);
+ }
+diff --git a/src/core/config/model_capabilities.zig b/src/core/config/model_capabilities.zig
+index 7640272..cc43c02 100644
+--- a/src/core/config/model_capabilities.zig
++++ b/src/core/config/model_capabilities.zig
+@@ -95,6 +95,11 @@ fn localCapabilitiesForModel(model: []const u8) Capabilities {
+         capabilities.supports_tool_use = true;
+         capabilities.parallel_tool_calls = true;
+         capabilities.max_output_tokens = 128_000;
++    } else if (std.mem.startsWith(u8, model, "opencode/") or
++        std.mem.startsWith(u8, model, "opencode-go/"))
++    {
++        capabilities.supports_tool_use = true;
++        capabilities.parallel_tool_calls = true;
+     } else if (std.mem.startsWith(u8, model, "anthropic/")) {
+         capabilities.prompt_caching = true;
+     } else if (std.mem.startsWith(u8, model, "xai/")) {
+@@ -191,6 +196,33 @@ fn localContextWindowSize(model: []const u8) ?u32 {
+     }
+     if (std.mem.startsWith(u8, model, "xai/")) return 131_072;
+     if (std.mem.startsWith(u8, model, "google/")) return 1_000_000;
++    if (std.mem.startsWith(u8, model, "opencode/") or std.mem.startsWith(u8, model, "opencode-go/")) {
++        const bare = if (std.mem.startsWith(u8, model, "opencode/"))
++            model["opencode/".len..]
++        else
++            model["opencode-go/".len..];
++        return opencodeContextWindowSize(bare);
++    }
++    return null;
++}
++
++/// Conservative context windows for OpenCode Zen/Go model families. The fleet
++/// changes often, so unknown families report no window instead of guessing.
++fn opencodeContextWindowSize(bare_model: []const u8) ?u32 {
++    const families = [_]struct { prefix: []const u8, window: u32 }{
++        .{ .prefix = "claude", .window = 200_000 },
++        .{ .prefix = "gemini", .window = 1_000_000 },
++        .{ .prefix = "gpt-5", .window = 400_000 },
++        .{ .prefix = "glm", .window = 200_000 },
++        .{ .prefix = "kimi", .window = 262_144 },
++        .{ .prefix = "deepseek", .window = 128_000 },
++        .{ .prefix = "grok", .window = 256_000 },
++        .{ .prefix = "minimax", .window = 200_000 },
++        .{ .prefix = "qwen", .window = 262_144 },
++    };
++    for (families) |family| {
++        if (std.mem.startsWith(u8, bare_model, family.prefix)) return family.window;
++    }
+     return null;
+ }
+ 
+diff --git a/src/core/session/session_commands.zig b/src/core/session/session_commands.zig
+index 7d33cf8..c337255 100644
+--- a/src/core/session/session_commands.zig
++++ b/src/core/session/session_commands.zig
+@@ -766,7 +766,26 @@ pub fn Commands(comptime App: type) type {
+             try applyEffort(app, effort, false, true);
+         }
+ 
++        /// OpenCode models need the OpenCode credential even when another
++        /// source is active, so adopt it when it resolves. This keeps
++        /// provider-prefixed models working no matter which credential the
++        /// user started with. Adoption is best effort: when no OpenCode key
++        /// resolves, keep the current source and let the transport produce
++        /// its actionable error.
++        fn reconcileCredentialForModel(app: *App, model: []const u8) !void {
++            if (comptime !@hasField(App, "auth")) return;
++            if (comptime !@hasDecl(App, "selectCredentialSource")) return;
++            const opencode = @import("../auth/opencode.zig");
++            if (!opencode.isModel(model)) return;
++            if (app.auth.credentialSource() == .opencode) return;
++            _ = app.selectCredentialSource(.opencode) catch |err| switch (err) {
++                error.OutOfMemory => return err,
++                else => return,
++            };
++        }
++
+         pub fn selectModelFromPicker(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) !void {
++            try reconcileCredentialForModel(app, model);
+             try setResolvedModelRuntime(app, model, true);
+             var patch = app_session_runtime.SessionPreferencePatch{ .model = model };
+             const capabilities = model_capabilities.resolveForApp(App, app, model);
+diff --git a/src/core/shared/types.zig b/src/core/shared/types.zig
+index 824c3f7..ea374e1 100644
+--- a/src/core/shared/types.zig
++++ b/src/core/shared/types.zig
+@@ -91,6 +91,7 @@ pub const CredentialSource = enum {
+     vercel_oidc_token,
+     ai_gateway_api_key,
+     openai_codex,
++    opencode,
+     fx_login,
+     stored_key,
+ };
+diff --git a/src/gateway/opencode.zig b/src/gateway/opencode.zig
+new file mode 100644
+index 0000000..19278a2
+--- /dev/null
++++ b/src/gateway/opencode.zig
+@@ -0,0 +1,769 @@
++const std = @import("std");
++const agent_stream_provider = @import("../core/agent/stream_provider.zig");
++const gateway_client = @import("client.zig");
++const io_mod = @import("../core/shared/io.zig");
++const opencode_auth = @import("../core/auth/opencode.zig");
++const types = @import("../core/shared/types.zig");
++
++const Allocator = std.mem.Allocator;
++
++pub const model_prefix = opencode_auth.model_prefix;
++pub const go_model_prefix = opencode_auth.go_model_prefix;
++const max_error_body_bytes: usize = 64 * 1024;
++const max_sse_line_bytes: usize = 1024 * 1024;
++
++pub fn isModel(model: []const u8) bool {
++    return opencode_auth.isModel(model);
++}
++
++pub fn buildRequest(
++    alloc: Allocator,
++    request: agent_stream_provider.BuildRequest,
++) ![]u8 {
++    const model_id = opencode_auth.requestModelId(request.model) orelse
++        return error.InvalidOpenCodeModel;
++    if (request.verified_images != null or request.vision_mode == .required) {
++        return error.OpenCodeImagesUnsupported;
++    }
++    if (request.response_format != null) return error.OpenCodeStructuredResponseUnsupported;
++
++    var tools: std.Io.Writer.Allocating = .init(alloc);
++    defer tools.deinit();
++    var tool_count: usize = 0;
++    try writeSerializedToolArray(alloc, &tools.writer, &tool_count, request.serialized_tools);
++    for (request.selected_dynamic_tool_schemas) |schema| {
++        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema, .{});
++        defer parsed.deinit();
++        try writeToolSchema(&tools.writer, &tool_count, parsed.value);
++    }
++
++    var out: std.Io.Writer.Allocating = .init(alloc);
++    errdefer out.deinit();
++    const writer = &out.writer;
++    try writer.writeAll("{\"model\":");
++    try std.json.Stringify.value(model_id, .{}, writer);
++    try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
++
++    var first_message = true;
++    for (request.messages) |message| {
++        try writeMessage(writer, &first_message, message);
++    }
++    try writer.writeAll("]");
++
++    if (tool_count > 0) {
++        try writer.writeAll(",\"tools\":[");
++        try writer.writeAll(tools.written());
++        try writer.writeAll("],\"tool_choice\":");
++        try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
++    }
++    if (request.max_output_tokens) |max_tokens| {
++        if (max_tokens > 0) {
++            try writer.print(",\"max_tokens\":{d}", .{max_tokens});
++        }
++    }
++    try writer.writeByte('}');
++    return out.toOwnedSlice();
++}
++
++fn writeMessage(
++    writer: *std.Io.Writer,
++    first: *bool,
++    message: types.ChatMessage,
++) !void {
++    try writeSeparator(writer, first);
++    switch (message.role) {
++        .system => {
++            try writer.writeAll("{\"role\":\"system\",\"content\":");
++            try std.json.Stringify.value(message.content orelse "", .{}, writer);
++            try writer.writeByte('}');
++        },
++        .user => {
++            try writer.writeAll("{\"role\":\"user\",\"content\":");
++            try std.json.Stringify.value(message.content orelse "", .{}, writer);
++            try writer.writeByte('}');
++        },
++        .assistant => {
++            const content = message.content orelse "";
++            try writer.writeAll("{\"role\":\"assistant\",\"content\":");
++            if (content.len == 0 and message.tool_calls.len > 0) {
++                try writer.writeAll("null");
++            } else {
++                try std.json.Stringify.value(content, .{}, writer);
++            }
++            if (message.tool_calls.len > 0) {
++                try writer.writeAll(",\"tool_calls\":[");
++                var first_call = true;
++                for (message.tool_calls) |call| {
++                    try writeSeparator(writer, &first_call);
++                    try writer.writeAll("{\"id\":");
++                    try std.json.Stringify.value(call.id, .{}, writer);
++                    try writer.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
++                    try std.json.Stringify.value(call.name, .{}, writer);
++                    try writer.writeAll(",\"arguments\":");
++                    try std.json.Stringify.value(call.arguments_json, .{}, writer);
++                    try writer.writeAll("}}");
++                }
++                try writer.writeByte(']');
++            }
++            try writer.writeByte('}');
++        },
++        .tool => {
++            const call_id = message.tool_call_id orelse return error.OpenCodeToolCallIdMissing;
++            try writer.writeAll("{\"role\":\"tool\",\"tool_call_id\":");
++            try std.json.Stringify.value(call_id, .{}, writer);
++            try writer.writeAll(",\"content\":");
++            try std.json.Stringify.value(message.content orelse "", .{}, writer);
++            try writer.writeByte('}');
++        },
++    }
++}
++
++fn writeSeparator(writer: *std.Io.Writer, first: *bool) !void {
++    if (!first.*) try writer.writeByte(',');
++    first.* = false;
++}
++
++/// Converts fx tool schemas (`inputSchema`) into OpenAI chat completions
++/// function tools. AI Gateway provider advertisements are not local functions
++/// and cannot execute on the OpenCode gateways, so they are skipped.
++fn writeSerializedToolArray(
++    alloc: Allocator,
++    writer: *std.Io.Writer,
++    count: *usize,
++    serialized_tools: []const u8,
++) !void {
++    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, serialized_tools, .{});
++    defer parsed.deinit();
++    if (parsed.value != .array) return error.InvalidOpenCodeTools;
++    for (parsed.value.array.items) |tool| {
++        if (isGatewayProviderAdvertisement(tool)) continue;
++        try writeToolSchema(writer, count, tool);
++    }
++}
++
++fn isGatewayProviderAdvertisement(tool: std.json.Value) bool {
++    if (tool != .object) return false;
++    const tool_type = tool.object.get("type") orelse return false;
++    return tool_type == .string and std.mem.eql(u8, tool_type.string, "provider");
++}
++
++fn writeToolSchema(writer: *std.Io.Writer, count: *usize, tool: std.json.Value) !void {
++    if (tool != .object) return error.InvalidOpenCodeTool;
++    const name = tool.object.get("name") orelse return error.InvalidOpenCodeTool;
++    const description = tool.object.get("description") orelse return error.InvalidOpenCodeTool;
++    const parameters = tool.object.get("inputSchema") orelse
++        tool.object.get("parameters") orelse return error.InvalidOpenCodeTool;
++    if (name != .string or description != .string or parameters != .object) {
++        return error.InvalidOpenCodeTool;
++    }
++    if (count.* > 0) try writer.writeByte(',');
++    count.* += 1;
++    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
++    try std.json.Stringify.value(name.string, .{}, writer);
++    try writer.writeAll(",\"description\":");
++    try std.json.Stringify.value(description.string, .{}, writer);
++    try writer.writeAll(",\"parameters\":");
++    try std.json.Stringify.value(parameters, .{}, writer);
++    try writer.writeAll("}}");
++}
++
++pub fn stream(
++    alloc: Allocator,
++    request: agent_stream_provider.Request,
++) !agent_stream_provider.Result {
++    const chat_url = opencode_auth.chatUrlForModel(request.model) orelse
++        return error.InvalidOpenCodeModel;
++    if (request.api_key.len == 0) return error.OpenCodeCredentialRequired;
++    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
++
++    const uri = try std.Uri.parse(chat_url);
++    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
++    defer alloc.free(auth_header);
++
++    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
++    defer client.deinit();
++    var http_request = try client.request(.POST, uri, .{
++        .headers = .{
++            .content_type = .{ .override = "application/json" },
++            .authorization = .{ .override = auth_header },
++            .accept_encoding = .omit,
++            .user_agent = .{ .override = gateway_client.user_agent },
++        },
++        .extra_headers = &.{},
++        .keep_alive = false,
++        .redirect_behavior = .unhandled,
++    });
++    defer http_request.deinit();
++
++    http_request.transfer_encoding = .{ .content_length = request.payload.len };
++    var send_buffer: [8192]u8 = undefined;
++    request.delivery.markPossiblySent();
++    var body_writer = try http_request.sendBodyUnflushed(&send_buffer);
++    try body_writer.writer.writeAll(request.payload);
++    try body_writer.end();
++    try http_request.connection.?.flush();
++    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
++
++    var response = try http_request.receiveHead(&.{});
++    if (response.head.status != .ok) {
++        var error_buffer: [max_error_body_bytes]u8 = undefined;
++        var error_writer = std.Io.Writer.fixed(&error_buffer);
++        var transfer_buffer: [4096]u8 = undefined;
++        const error_reader = response.reader(&transfer_buffer);
++        _ = error_reader.streamRemaining(&error_writer) catch {};
++        return .{
++            .status = response.head.status,
++            .err_body = try alloc.dupe(u8, error_writer.buffered()),
++            .ownership = .owned,
++        };
++    }
++
++    request.attempt_evidence.provider_admitted = true;
++    var transfer_buffer: [8192]u8 = undefined;
++    const reader = response.reader(&transfer_buffer);
++    const completion = try consumeSseStream(alloc, reader, request);
++    return .{
++        .status = .ok,
++        .completion = completion,
++        .reconcile_generation_usage = false,
++        .ownership = .owned,
++    };
++}
++
++const SseReader = struct {
++    pending: std.ArrayList(u8) = .empty,
++
++    fn deinit(self: *SseReader, alloc: Allocator) void {
++        self.pending.deinit(alloc);
++    }
++
++    fn release(self: *SseReader) void {
++        self.pending.clearRetainingCapacity();
++    }
++
++    fn next(self: *SseReader, alloc: Allocator, reader: *std.Io.Reader) !?[]const u8 {
++        while (true) {
++            const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
++                error.StreamTooLong => {
++                    const buffered = reader.buffered();
++                    if (buffered.len == 0) return error.OpenCodeSseReadStalled;
++                    if (buffered.len > max_sse_line_bytes - self.pending.items.len) {
++                        return error.OpenCodeSseEventTooLarge;
++                    }
++                    try self.pending.appendSlice(alloc, buffered);
++                    reader.tossBuffered();
++                    continue;
++                },
++                error.ReadFailed => return error.ReadFailed,
++            } orelse {
++                if (self.pending.items.len > 0) return self.pending.items;
++                return null;
++            };
++            if (fragment.len > max_sse_line_bytes - self.pending.items.len) {
++                return error.OpenCodeSseEventTooLarge;
++            }
++            if (self.pending.items.len == 0) return fragment;
++            try self.pending.appendSlice(alloc, fragment);
++            return self.pending.items;
++        }
++    }
++};
++
++/// One in-flight streamed tool call, keyed by its `tool_calls[].index`.
++const ToolCallAccumulator = struct {
++    index: u64,
++    id: std.ArrayList(u8) = .empty,
++    name: std.ArrayList(u8) = .empty,
++    arguments: std.ArrayList(u8) = .empty,
++    announced: bool = false,
++
++    fn deinit(self: *ToolCallAccumulator, alloc: Allocator) void {
++        self.id.deinit(alloc);
++        self.name.deinit(alloc);
++        self.arguments.deinit(alloc);
++    }
++
++    fn ready(self: *const ToolCallAccumulator) bool {
++        return self.id.items.len > 0 and self.name.items.len > 0;
++    }
++};
++
++fn findAccumulator(
++    accumulators: []ToolCallAccumulator,
++    index: u64,
++) ?*ToolCallAccumulator {
++    for (accumulators) |*accumulator| {
++        if (accumulator.index == index) return accumulator;
++    }
++    return null;
++}
++
++fn consumeSseStream(
++    alloc: Allocator,
++    reader: *std.Io.Reader,
++    request: agent_stream_provider.Request,
++) !types.GatewayCompletion {
++    var content: std.ArrayList(u8) = .empty;
++    defer content.deinit(alloc);
++    var accumulators: std.ArrayList(ToolCallAccumulator) = .empty;
++    defer {
++        for (accumulators.items) |*accumulator| accumulator.deinit(alloc);
++        accumulators.deinit(alloc);
++    }
++    var provider_failure_detail: ?[]u8 = null;
++    errdefer if (provider_failure_detail) |detail| alloc.free(detail);
++    var usage: types.Usage = .{};
++    var finish_reason: ?types.ProviderFinishReason = null;
++    var saw_done = false;
++    var provider_failed = false;
++    var sse_reader: SseReader = .{};
++    defer sse_reader.deinit(alloc);
++
++    while (!saw_done and !provider_failed) {
++        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
++        const raw_line = (try sse_reader.next(alloc, reader)) orelse break;
++        defer sse_reader.release();
++        const line = std.mem.trim(u8, raw_line, "\r");
++        if (line.len == 0 or line[0] == ':') continue;
++        const prefix = "data:";
++        if (!std.mem.startsWith(u8, line, prefix)) continue;
++        const data = std.mem.trimStart(u8, line[prefix.len..], " ");
++        if (std.mem.eql(u8, data, "[DONE]")) {
++            saw_done = true;
++            break;
++        }
++
++        var parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch |err| {
++            if (err == error.OutOfMemory) return err;
++            continue;
++        };
++        defer parsed.deinit();
++        if (parsed.value != .object) continue;
++        const root = parsed.value.object;
++
++        if (root.get("error")) |error_value| {
++            const detail = errorMessageValue(error_value) orelse "OpenCode response failed";
++            provider_failure_detail = try alloc.dupe(u8, detail);
++            finish_reason = .provider_error;
++            provider_failed = true;
++            break;
++        }
++
++        if (root.get("usage")) |usage_value| {
++            if (usage_value == .object) usage = parseUsage(usage_value.object);
++        }
++
++        const choices_value = root.get("choices") orelse continue;
++        if (choices_value != .array) continue;
++        for (choices_value.array.items) |choice_value| {
++            if (choice_value != .object) continue;
++            const choice = choice_value.object;
++
++            if (choice.get("finish_reason")) |finish_value| {
++                if (finish_value == .string) {
++                    finish_reason = mapFinishReason(finish_value.string);
++                }
++            }
++
++            const delta_value = choice.get("delta") orelse continue;
++            if (delta_value != .object) continue;
++            const delta = delta_value.object;
++
++            if (stringField(delta, "content")) |text_delta| {
++                if (text_delta.len > 0) {
++                    request.on_content_chunk(request.callback_ctx, text_delta);
++                    try appendCaptured(alloc, &content, text_delta, request.content_capture_limit);
++                }
++            }
++
++            if (reasoningDelta(delta)) |reasoning_delta| {
++                if (request.on_reasoning_chunk) |callback| callback(request.callback_ctx, reasoning_delta);
++            }
++
++            const tool_calls_value = delta.get("tool_calls") orelse continue;
++            if (tool_calls_value != .array) continue;
++            for (tool_calls_value.array.items) |streamed_value| {
++                if (streamed_value != .object) continue;
++                const streamed = streamed_value.object;
++                const index = nonNegativeInteger(streamed.get("index")) orelse 0;
++                var accumulator = findAccumulator(accumulators.items, index) orelse blk: {
++                    try accumulators.append(alloc, .{ .index = index });
++                    break :blk &accumulators.items[accumulators.items.len - 1];
++                };
++                if (stringField(streamed, "id")) |id| {
++                    if (id.len > 0 and accumulator.id.items.len == 0) {
++                        try accumulator.id.appendSlice(alloc, id);
++                    }
++                }
++                if (streamed.get("function")) |function_value| {
++                    if (function_value == .object) {
++                        const function = function_value.object;
++                        if (stringField(function, "name")) |name| {
++                            if (name.len > 0) try accumulator.name.appendSlice(alloc, name);
++                        }
++                        if (stringField(function, "arguments")) |arguments| {
++                            if (arguments.len > 0) {
++                                try accumulator.arguments.appendSlice(alloc, arguments);
++                                if (request.on_tool_input_chunk) |callback| {
++                                    callback(request.callback_ctx, arguments);
++                                }
++                            }
++                        }
++                    }
++                }
++                if (!accumulator.announced and accumulator.ready()) {
++                    accumulator.announced = true;
++                    if (request.on_tool_start) |callback| {
++                        callback(
++                            request.callback_ctx,
++                            accumulator.id.items,
++                            accumulator.name.items,
++                            null,
++                        );
++                    }
++                }
++            }
++        }
++    }
++
++    // Some OpenAI-compatible backends close the stream after the terminal
++    // finish_reason without a [DONE] sentinel. Accept that ending when a
++    // terminal state was observed; only an unexplained early end fails.
++    const observed_finish = finish_reason != null and finish_reason.? != .provider_error;
++    if (!saw_done and !provider_failed and !observed_finish) {
++        return error.OpenCodeStreamEndedEarly;
++    }
++
++    var owned_tools: std.ArrayList(types.ToolCall) = .empty;
++    errdefer for (owned_tools.items) |call| types.freeToolCall(alloc, call);
++    for (accumulators.items) |*accumulator| {
++        if (accumulator.id.items.len == 0 and accumulator.name.items.len == 0) continue;
++        const owned_id = try alloc.dupe(u8, accumulator.id.items);
++        errdefer alloc.free(owned_id);
++        const owned_name = try alloc.dupe(u8, accumulator.name.items);
++        errdefer alloc.free(owned_name);
++        const owned_arguments = try alloc.dupe(u8, accumulator.arguments.items);
++        errdefer alloc.free(owned_arguments);
++        try owned_tools.append(alloc, .{
++            .id = owned_id,
++            .name = owned_name,
++            .arguments_json = owned_arguments,
++            .argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(
++                alloc,
++                accumulator.arguments.items,
++            ),
++        });
++    }
++
++    const finish = finish_reason orelse
++        if (owned_tools.items.len > 0) types.ProviderFinishReason.tool_calls else .stop;
++    const owned_content: ?[]u8 = if (content.items.len > 0) try content.toOwnedSlice(alloc) else null;
++    errdefer if (owned_content) |value| alloc.free(value);
++    const tools_slice = try owned_tools.toOwnedSlice(alloc);
++    return .{
++        .content = owned_content,
++        .tool_calls = tools_slice,
++        .provider_failure_detail = provider_failure_detail,
++        .finish_reason = finish,
++        .usage = usage,
++    };
++}
++
++/// Chat completions providers stream reasoning under several field names;
++/// use the first non-empty one to avoid duplicated thinking output.
++fn reasoningDelta(delta: std.json.ObjectMap) ?[]const u8 {
++    const fields = [_][]const u8{ "reasoning_content", "reasoning", "reasoning_text" };
++    for (fields) |field| {
++        const value = stringField(delta, field) orelse continue;
++        if (value.len > 0) return value;
++    }
++    return null;
++}
++
++fn mapFinishReason(raw: []const u8) types.ProviderFinishReason {
++    if (std.mem.eql(u8, raw, "stop")) return .stop;
++    if (std.mem.eql(u8, raw, "length")) return .length;
++    if (std.mem.eql(u8, raw, "content_filter")) return .content_filter;
++    if (std.mem.eql(u8, raw, "tool_calls") or std.mem.eql(u8, raw, "function_call")) {
++        return .tool_calls;
++    }
++    return .other;
++}
++
++fn appendCaptured(
++    alloc: Allocator,
++    content: *std.ArrayList(u8),
++    delta: []const u8,
++    limit: ?usize,
++) !void {
++    const remaining = if (limit) |maximum| maximum -| @min(maximum, content.items.len) else delta.len;
++    try content.appendSlice(alloc, delta[0..@min(delta.len, remaining)]);
++}
++
++fn parseUsage(object: std.json.ObjectMap) types.Usage {
++    return .{
++        .input_tokens = nonNegativeInteger(object.get("prompt_tokens")),
++        .output_tokens = nonNegativeInteger(object.get("completion_tokens")),
++    };
++}
++
++fn errorMessageValue(value: std.json.Value) ?[]const u8 {
++    switch (value) {
++        .string => |text| return text,
++        .object => |object| {
++            if (stringField(object, "message")) |message| return message;
++            return null;
++        },
++        else => return null,
++    }
++}
++
++fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
++    const value = object.get(key) orelse return null;
++    return if (value == .string) value.string else null;
++}
++
++fn nonNegativeInteger(value: ?std.json.Value) ?u64 {
++    const actual = value orelse return null;
++    if (actual != .integer or actual.integer < 0) return null;
++    return @intCast(actual.integer);
++}
++
++test "OpenCode request maps messages tools and namespaces" {
++    const tools =
++        "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
++    const calls = [_]types.ToolCall{.{
++        .id = "call_1",
++        .name = "read_file",
++        .arguments_json = "{\"path\":\"README.md\"}",
++    }};
++    const messages = [_]types.ChatMessage{
++        .{ .role = .system, .content = "Be concise." },
++        .{ .role = .user, .content = "Read it" },
++        .{ .role = .assistant, .content = "Opening it.", .tool_calls = &calls },
++        .{ .role = .tool, .tool_call_id = "call_1", .content = "contents" },
++    };
++    for ([_][]const u8{ "opencode/kimi-k3", "opencode-go/kimi-k3" }) |model| {
++        const body = try buildRequest(std.testing.allocator, .{
++            .credential_source = .opencode,
++            .model = model,
++            .serialized_tools = tools,
++            .messages = &messages,
++            .tool_choice = .auto,
++            .vision_mode = .optional,
++            .provider_options = .{},
++        });
++        defer std.testing.allocator.free(body);
++        try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"kimi-k3\"") != null);
++        try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
++        try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
++        try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\",\"tool_call_id\":\"call_1\"") != null);
++        try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\",\"function\":{\"name\":\"read_file\"") != null);
++        try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
++        try std.testing.expect(std.mem.indexOf(u8, body, "\"inputSchema\"") == null);
++    }
++}
++
++test "OpenCode request omits empty tool block and honours output limit" {
++    const messages = [_]types.ChatMessage{
++        .{ .role = .user, .content = "Hello" },
++    };
++    const body = try buildRequest(std.testing.allocator, .{
++        .credential_source = .opencode,
++        .model = "opencode/glm-5",
++        .serialized_tools = "[]",
++        .messages = &messages,
++        .tool_choice = .auto,
++        .provider_options = .{},
++        .max_output_tokens = 4096,
++    });
++    defer std.testing.allocator.free(body);
++    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\"") == null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":4096") != null);
++}
++
++test "OpenCode request rejects gateway provider advertisements and images" {
++    const tools =
++        "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}," ++
++        "{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\",\"args\":{}}]";
++    const messages = [_]types.ChatMessage{
++        .{ .role = .user, .content = "Hello" },
++    };
++    const body = try buildRequest(std.testing.allocator, .{
++        .credential_source = .opencode,
++        .model = "opencode/kimi-k3",
++        .serialized_tools = tools,
++        .messages = &messages,
++        .tool_choice = .auto,
++        .provider_options = .{},
++    });
++    defer std.testing.allocator.free(body);
++    try std.testing.expect(std.mem.indexOf(u8, body, "\"name\":\"read_file\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "perplexity_search") == null);
++
++    try std.testing.expectError(error.OpenCodeImagesUnsupported, buildRequest(std.testing.allocator, .{
++        .credential_source = .opencode,
++        .model = "opencode/kimi-k3",
++        .serialized_tools = "[]",
++        .messages = &messages,
++        .tool_choice = .auto,
++        .vision_mode = .required,
++        .provider_options = .{},
++    }));
++}
++
++test "OpenCode SSE maps text reasoning tools and usage" {
++    const Capture = struct {
++        content_bytes: usize = 0,
++        reasoning_bytes: usize = 0,
++        tool_starts: usize = 0,
++        tool_argument_bytes: usize = 0,
++
++        fn content(raw: *anyopaque, chunk: []const u8) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.content_bytes += chunk.len;
++        }
++
++        fn reasoning(raw: *anyopaque, chunk: []const u8) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.reasoning_bytes += chunk.len;
++        }
++
++        fn toolStart(
++            raw: *anyopaque,
++            _: []const u8,
++            _: []const u8,
++            _: ?[]const u8,
++        ) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.tool_starts += 1;
++        }
++
++        fn toolArguments(raw: *anyopaque, chunk: []const u8) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.tool_argument_bytes += chunk.len;
++        }
++    };
++    const payload =
++        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" ++
++        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n" ++
++        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" ++
++        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n" ++
++        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]}}]}\n\n" ++
++        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n" ++
++        "data: [DONE]\n\n";
++    var reader = std.Io.Reader.fixed(payload);
++    var cancel = std.atomic.Value(bool).init(false);
++    var delivery = agent_stream_provider.DeliveryCertainty.init();
++    var evidence: agent_stream_provider.AttemptEvidence = .{};
++    var capture: Capture = .{};
++    const completion = try consumeSseStream(std.testing.allocator, &reader, .{
++        .api_key = "key",
++        .team = null,
++        .model = "opencode/kimi-k3",
++        .retry_count = 1,
++        .chat_url = "",
++        .payload = "{}",
++        .trace_ctx = .{},
++        .content_capture_limit = null,
++        .delivery = &delivery,
++        .attempt_evidence = &evidence,
++        .callback_ctx = &capture,
++        .on_content_chunk = Capture.content,
++        .on_tool_start = Capture.toolStart,
++        .on_reasoning_chunk = Capture.reasoning,
++        .on_tool_input_chunk = Capture.toolArguments,
++        .cancel_flag = &cancel,
++        .credential_source = .opencode,
++    });
++    defer {
++        if (completion.content) |content| std.testing.allocator.free(@constCast(content));
++        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
++    }
++    try std.testing.expectEqualStrings("Hello", completion.content.?);
++    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
++    try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
++    try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
++    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", completion.tool_calls[0].arguments_json);
++    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
++    try std.testing.expectEqual(@as(?u64, 11), completion.usage.input_tokens);
++    try std.testing.expectEqual(@as(?u64, 7), completion.usage.output_tokens);
++    try std.testing.expectEqual(@as(usize, 5), capture.content_bytes);
++    try std.testing.expectEqual(@as(usize, 8), capture.reasoning_bytes);
++    try std.testing.expectEqual(@as(usize, 1), capture.tool_starts);
++    try std.testing.expectEqual(@as(usize, 20), capture.tool_argument_bytes);
++}
++
++test "OpenCode SSE surfaces provider errors without a done sentinel" {
++    const payload =
++        "data: {\"error\":{\"message\":\"invalid api key\"}}\n\n";
++    var reader = std.Io.Reader.fixed(payload);
++    var cancel = std.atomic.Value(bool).init(false);
++    var delivery = agent_stream_provider.DeliveryCertainty.init();
++    var evidence: agent_stream_provider.AttemptEvidence = .{};
++    const completion = try consumeSseStream(std.testing.allocator, &reader, .{
++        .api_key = "key",
++        .team = null,
++        .model = "opencode/kimi-k3",
++        .retry_count = 1,
++        .chat_url = "",
++        .payload = "{}",
++        .trace_ctx = .{},
++        .content_capture_limit = null,
++        .delivery = &delivery,
++        .attempt_evidence = &evidence,
++        .callback_ctx = &discard_callback_ctx,
++        .on_content_chunk = discardCallback,
++        .on_tool_start = null,
++        .on_reasoning_chunk = null,
++        .cancel_flag = &cancel,
++        .credential_source = .opencode,
++    });
++    defer {
++        if (completion.content) |content| std.testing.allocator.free(@constCast(content));
++        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
++        if (completion.provider_failure_detail) |detail| std.testing.allocator.free(@constCast(detail));
++    }
++    try std.testing.expectEqualStrings("invalid api key", completion.provider_failure_detail.?);
++    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
++}
++
++var discard_callback_ctx: u8 = 0;
++fn discardCallback(_: *anyopaque, _: []const u8) void {}
++
++test "OpenCode SSE accepts a clean close after finish_reason without DONE" {
++    const Capture = struct {
++        fn content(_: *anyopaque, _: []const u8) void {}
++    };
++    const payload =
++        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n" ++
++        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
++    var reader = std.Io.Reader.fixed(payload);
++    var cancel = std.atomic.Value(bool).init(false);
++    var delivery = agent_stream_provider.DeliveryCertainty.init();
++    var evidence: agent_stream_provider.AttemptEvidence = .{};
++    const completion = try consumeSseStream(std.testing.allocator, &reader, .{
++        .api_key = "key",
++        .team = null,
++        .model = "opencode/kimi-k3",
++        .retry_count = 1,
++        .chat_url = "",
++        .payload = "{}",
++        .trace_ctx = .{},
++        .content_capture_limit = null,
++        .delivery = &delivery,
++        .attempt_evidence = &evidence,
++        .callback_ctx = &discard_callback_ctx,
++        .on_content_chunk = Capture.content,
++        .on_tool_start = null,
++        .on_reasoning_chunk = null,
++        .cancel_flag = &cancel,
++        .credential_source = .opencode,
++    });
++    defer {
++        if (completion.content) |content| std.testing.allocator.free(@constCast(content));
++    }
++    try std.testing.expectEqualStrings("Hi", completion.content.?);
++    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
++}
+diff --git a/src/opencode_test.zig b/src/opencode_test.zig
+new file mode 100644
+index 0000000..7a50902
+--- /dev/null
++++ b/src/opencode_test.zig
+@@ -0,0 +1,5 @@
++test {
++    _ = @import("core/auth/opencode.zig");
++    _ = @import("gateway/opencode.zig");
++    _ = @import("core/config/model_capabilities.zig");
++}
+-- 
+2.47.3
+

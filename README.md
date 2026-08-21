@@ -1,15 +1,16 @@
 # fx-fork
 
-Patch set adding OpenAI Codex subscription authentication and transport support
-to [vercel-labs/fx](https://github.com/vercel-labs/fx).
+Patch set adding OpenAI Codex subscription and OpenCode (Zen / Go) provider
+support to [vercel-labs/fx](https://github.com/vercel-labs/fx).
 
 This is intentionally a patches-and-documentation repository, not a GitHub
 fork and not a copy of the upstream source tree. The patch mailbox in
 `patches/fx/` is the source of truth. CI checks out the pinned upstream commit,
 applies the patch with `git am`, compiles fx, and runs the focused unit tests.
 
-See [IV-0001](docs/IV-0001-openai-codex-subscription.md) for the design,
-security boundaries, implementation map, and verification details.
+See [IV-0001](docs/IV-0001-openai-codex-subscription.md) for the Codex design
+and [IV-0002](docs/IV-0002-opencode-providers.md) for the OpenCode providers,
+including how the same model name on several providers is disambiguated.
 
 ## Apply the patch
 
@@ -19,8 +20,8 @@ git clone https://github.com/vercel-labs/fx.git fx
 git -C fx checkout ac0ce0b64409404b3f35cc264f62c5d14ef1ba37
 git -C fx am "$(pwd)"/fx-fork/patches/fx/*.patch
 cd fx
-zig build
 zig build test-openai-codex --summary all
+zig build test-opencode --summary all
 ```
 
 ## Use it
@@ -39,6 +40,18 @@ zig build test-openai-codex --summary all
 The login flow uses OpenAI's device authorization flow and selects
 `openai-codex/gpt-5.6-sol`. Subscription traffic goes directly to the ChatGPT
 Codex Responses endpoint, never through Vercel AI Gateway.
+
+### OpenCode Zen and OpenCode Go
+
+```bash
+./zig-out/bin/fx login opencode            # key read from stdin, or pass it:
+./zig-out/bin/fx login opencode-go <key>   # same account key, Go fleet default
+```
+
+Both fleets accept the same OpenCode API key; `OPENCODE_API_KEY` also works
+without any login. Models are namespaced by provider — `opencode/kimi-k3`,
+`opencode-go/mimo-v2.5`, `openai-codex/gpt-5.6-sol`, or a bare AI Gateway id —
+so the same model name served by several providers is never ambiguous.
 
 ## Releases
 
