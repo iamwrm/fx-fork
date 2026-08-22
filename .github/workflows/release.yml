@@ -153,17 +153,20 @@ jobs:
             exit 1
           fi
           printf '%s\n' \
-            'OpenAI Codex subscription support for fx 0.0.4.' \
+            'fx-fork v0.0.6-codex.1 — OpenCode provider support for fx v0.0.5.' \
             '' \
-            '- Device-code login with refreshable OpenAI credentials' \
-            '- Direct ChatGPT Codex Responses transport' \
-            '- Reasoning and function-tool streaming' \
-            '- Codex credential isolation from Vercel AI Gateway' \
-            '- Text-only turns no longer fail when Vision is available but unused' \
-            '- Supported openai/ model aliases use the active Codex subscription' \
-            '- Gateway-only provider tool advertisements are omitted from direct Codex requests' \
+            'Based on vercel-labs/fx v0.0.5 (df7e624), which ships native Codex' \
+            'and Grok subscription support with provider switching.' \
             '' \
-            'Built from the pinned vercel-labs/fx base and the IV-0001 patch in this repository.' \
+            'Fork additions:' \
+            '- OpenCode Zen (opencode/<model>) and OpenCode Go (opencode-go/<model>) fleets' \
+            '  - fx login opencode / fx login opencode-go <key>, or OPENCODE_API_KEY' \
+            '  - Per-provider credential authorization: OpenCode traffic never rides' \
+            '    Gateway, Codex, or Grok credentials, and vice versa' \
+            '  - Provider-scoped model catalogs for /models; manual ids still accepted' \
+            '- Upstream auto-upgrade disabled in patched builds (install updates here)' \
+            '' \
+            'Codex subscription is now upstream-native: use fx login codex.' \
             'Both archives include LICENSE and THIRD_PARTY_NOTICES.md.' \
             'The macOS arm64 executable is ad-hoc signed and is not Apple-notarized.' \
             > release-notes.md
