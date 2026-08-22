@@ -10,7 +10,7 @@ on:
       tag:
         description: Release tag
         required: true
-        default: v0.0.4-codex.3
+        default: v0.0.6-codex.1
 
 permissions:
   contents: read
@@ -73,14 +73,13 @@ jobs:
         working-directory: checkouts/fx
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
 
-      - name: Test Codex support
+      - name: Test OpenCode support
         working-directory: checkouts/fx
         shell: bash
         run: |
           set -euo pipefail
-          zig build test-openai-codex -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} --summary all
+          zig build test-opencode -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} --summary all
           ./zig-out/bin/fx --version
-          ./zig-out/bin/fx login --help | grep 'OpenAI Codex'
 
       - name: Validate Linux binary
         if: runner.os == 'Linux'
@@ -144,9 +143,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_tag="${REQUESTED_TAG:-v0.0.4-codex.3}"
-          if ! [[ "$release_tag" =~ ^v0\.0\.4-codex\.[1-9][0-9]*$ ]]; then
-            echo "::error::release tag must match v0.0.4-codex.N"
+          release_tag="${REQUESTED_TAG:-v0.0.6-codex.1}"
+          if ! [[ "$release_tag" =~ ^v0\.0\.[5-9]-codex\.[1-9][0-9]*$ ]]; then
+            echo "::error::release tag must match v0.0.N-codex.M (N>=5)"
             exit 1
           fi
           if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

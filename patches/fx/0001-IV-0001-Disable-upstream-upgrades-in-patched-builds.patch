@@ -1,43 +1,44 @@
-From 296797e75c023a485d2dfdecb5216a4d2c9e5333 Mon Sep 17 00:00:00 2001
+From 78e56f4d366ec01b6439c13ab9f1842265cd2d6f Mon Sep 17 00:00:00 2001
 From: iamwrm <22743891+iamwrm@users.noreply.github.com>
 Date: Thu, 20 Aug 2026 18:07:49 +0900
-Subject: [PATCH] IV-0001 Disable upstream upgrades in patched builds
+Subject: [PATCH 1/2] IV-0001 Disable upstream upgrades in patched builds
 
 ---
- README.md                         |  2 ++
+ README.md                         |  4 ++++
  src/core/cli/cli_surface.zig      | 18 ++++++++++++++++++
  src/core/fork_build.zig           |  8 ++++++++
  src/core/upgrade/auto_upgrade.zig |  2 ++
- src/openai_codex_test.zig         |  1 +
- 5 files changed, 31 insertions(+)
+ 4 files changed, 32 insertions(+)
  create mode 100644 src/core/fork_build.zig
 
 diff --git a/README.md b/README.md
-index 50089b7..29574fa 100644
+index 7c89176..e6a5210 100644
 --- a/README.md
 +++ b/README.md
-@@ -47,6 +47,8 @@ fx login openai-codex
+@@ -59,6 +59,10 @@ To use an AI Gateway API key instead:
+ fx setup
+ ```
  
- This stores a refreshable OpenAI session in the fx profile and selects `openai-codex/gpt-5.6-sol`. Use `fx logout openai-codex` to remove it. Codex subscription requests go directly to the ChatGPT Codex Responses endpoint and are not sent through Vercel AI Gateway.
- 
-+This patched build does not use fx's upstream auto-upgrade channel because an official upgrade would remove the Codex subscription transport. Install patched updates from [iamwrm/fx-fork releases](https://github.com/iamwrm/fx-fork/releases).
++This patched build does not use fx's upstream auto-upgrade channel because an
++official upgrade would remove the fork-only OpenCode (Zen / Go) providers.
++Install patched updates from [iamwrm/fx-fork releases](https://github.com/iamwrm/fx-fork/releases).
 +
  Run fx from a project:
  
  ```bash
 diff --git a/src/core/cli/cli_surface.zig b/src/core/cli/cli_surface.zig
-index 1697a58..969b09d 100644
+index 913b2cf..eb0e958 100644
 --- a/src/core/cli/cli_surface.zig
 +++ b/src/core/cli/cli_surface.zig
-@@ -13,6 +13,7 @@ const config_runtime = @import("../config/config_runtime.zig");
- const devbox_executor = @import("../execution/devbox_executor.zig");
+@@ -17,6 +17,7 @@ const model_provider = @import("../config/model_provider.zig");
+ const debug_trace = @import("../shared/debug_trace.zig");
  const doctor_runtime = @import("doctor_runtime.zig");
  const gateway_provider = @import("../gateway/gateway_provider.zig");
 +const fork_build = @import("../fork_build.zig");
  const model_catalog = @import("../gateway/model_catalog.zig");
+ const agent_stream_provider = @import("../agent/stream_provider.zig");
  const background_process_provider = @import(
-     "../execution/background_process_provider.zig",
-@@ -1377,6 +1378,23 @@ fn runNonInteractiveWithDeps(
+@@ -1638,6 +1639,23 @@ fn runNonInteractiveWithDeps(
                  try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .upgrade, "upgrade", err, rest);
                  return .handled_failure;
              };
@@ -94,17 +95,6 @@ index f1087e7..a0af8db 100644
      var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
      const n = std.process.executablePath(io_mod.getIo(), &exe_buf) catch return true;
      return !isDevelopmentBuildPath(exe_buf[0..n]);
-diff --git a/src/openai_codex_test.zig b/src/openai_codex_test.zig
-index 94891f5..770950f 100644
---- a/src/openai_codex_test.zig
-+++ b/src/openai_codex_test.zig
-@@ -1,5 +1,6 @@
- test {
-     _ = @import("core/auth/openai_codex.zig");
-     _ = @import("core/auth/credentials.zig");
-+    _ = @import("core/fork_build.zig");
-     _ = @import("gateway/openai_codex.zig");
- }
 -- 
-2.51.1
+2.47.3
 

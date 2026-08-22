@@ -169,3 +169,24 @@ both `BASE` files.
 
 Retire this patch when fx provides equivalent native OpenAI Codex subscription
 authentication and direct transport support upstream.
+
+## Retirement (v0.0.5 rebase, 2026-08)
+
+Upstream shipped native Codex subscription support between our old base
+(`ac0ce0b`) and v0.0.5 (`df7e624`), led by `d127472` (provider switching) plus
+the hardening series `a205fb9`, `c9a324a`, and `3cb9a4a`. Upstream now provides
+everything this patch introduced — device/browser OAuth with the same client id
+(`chatgpt_oauth.zig`), the direct ChatGPT Codex Responses transport
+(`src/gateway/openai_codex.zig`), provider-scoped model catalogs, and
+per-provider credential authorization — with stricter stream/tool limits than
+ours. The retirement condition above is met.
+
+Consequences for the fork:
+
+- Patches 0001 (subscription support), 0003 (text routing / `openai/` aliases),
+  and 0004 (Gateway provider-tool filtering; upstream only forwards
+  `type:"function"` tools) are **dropped** as superseded.
+- Patch 0002 (disable upstream upgrades) is **kept** and rebased: the fork still
+  ships OpenCode providers that an official binary would remove.
+- Users migrate from `fx login openai-codex` / `openai-codex/gpt-5.6-sol` to
+  upstream's `fx login codex` and raw catalog model ids.

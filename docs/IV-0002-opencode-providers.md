@@ -121,3 +121,30 @@ are advertised yet because effort control is not uniform across the fleets.
 - Credential-mismatch errors render as error names in the CLI surface, matching
   the existing Codex behavior; humanized copy is a shared follow-up.
 - Reasoning effort mapping per OpenCode family is not implemented.
+
+## Rebase onto v0.0.5 (2026-08)
+
+Upstream v0.0.5 replaced global credential precedence with explicit provider
+switching (`model_provider.ProviderId`, provider-scoped catalogs, per-provider
+credentials). The original namespace-routing design was adapted rather than
+rebased verbatim:
+
+- New provider ids `.opencode` and `.opencode_go` join `.gateway/.codex/.grok`;
+  both authorize only the `.opencode` credential source (`authorizesCredential`),
+  so OpenCode traffic can never ride Gateway/Codex/Grok credentials or vice
+  versa — the multi-provider conflict reported against the previous release.
+- Transports register through `src/builtins/providers.zig`; the OpenCode
+  transport is self-contained, so no injected config fields are required.
+- A static provider-scoped catalog (`model_catalog_provider`,
+  `cli_model_catalog_provider` in `src/gateway/opencode.zig`) feeds `/models`;
+  manual `opencode/<id>` selection still works. Dynamic fleet catalogs remain a
+  follow-up.
+- Per-provider saved models persist under `settings.opencode_model`
+  (`config_runtime`, `settings_store`, doctor, ACP, and app runtimes updated).
+- The old gateway.zig namespace guards moved out of `buildAgentRequest`; the
+  streaming path refuses `.opencode` credentials for Gateway traffic via
+  `SubscriptionCredentialCannotAuthorizeGateway`.
+
+Verification: `zig build test-opencode` passes 8/8 on v0.0.5; the full suite
+shows a failure set byte-identical to pristine v0.0.5 (pre-existing upstream
+environment-dependent tests), i.e. zero regressions from the rebase.
