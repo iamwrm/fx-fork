@@ -39,15 +39,6 @@ jobs:
           actual_commit=$(git -C checkouts/fx rev-parse HEAD)
           test "$actual_commit" = "$expected_commit"
 
-      - name: Apply patch stack
-        shell: bash
-        working-directory: checkouts/fx
-        run: |
-          set -euo pipefail
-          git config user.name github-actions
-          git config user.email github-actions@users.noreply.github.com
-          git am ../../patches/fx/*.patch
-
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
@@ -60,11 +51,6 @@ jobs:
       - name: Compile
         working-directory: checkouts/fx
         run: zig build
-
-      - name: Run focused unit tests
-        working-directory: checkouts/fx
-        run: |
-          zig build test-opencode --summary all
 
       - name: Run full unit suite
         working-directory: checkouts/fx
